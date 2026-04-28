@@ -1,4 +1,5 @@
 #include "afe_audio_processor.h"
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 
 #define PROCESSOR_RUNNING 0x01
@@ -67,16 +68,40 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
     afe_iface_ = esp_afe_handle_from_config(afe_config);
     afe_data_ = afe_iface_->create_from_config(afe_config);
     
-    xTaskCreate([](void* arg) {
+    audio_processor_task_stack_ = (StackType_t*)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    audio_processor_task_buffer_ = (StaticTask_t*)heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (audio_processor_task_stack_ == nullptr || audio_processor_task_buffer_ == nullptr) {
+        ESP_LOGE(TAG, "Failed to allocate audio communication task stack/buffer");
+        if (audio_processor_task_stack_ != nullptr) {
+            heap_caps_free(audio_processor_task_stack_);
+            audio_processor_task_stack_ = nullptr;
+        }
+        if (audio_processor_task_buffer_ != nullptr) {
+            heap_caps_free(audio_processor_task_buffer_);
+            audio_processor_task_buffer_ = nullptr;
+        }
+        return;
+    }
+
+    audio_processor_task_ = xTaskCreateStatic([](void* arg) {
         auto this_ = (AfeAudioProcessor*)arg;
         this_->AudioProcessorTask();
         vTaskDelete(NULL);
-    }, "audio_communication", 4096, this, 3, NULL);
+    }, "audio_communication", 4096, this, 3, audio_processor_task_stack_, audio_processor_task_buffer_);
+    if (audio_processor_task_ == nullptr) {
+        ESP_LOGE(TAG, "Failed to create audio communication task");
+    }
 }
 
 AfeAudioProcessor::~AfeAudioProcessor() {
     if (afe_data_ != nullptr) {
         afe_iface_->destroy(afe_data_);
+    }
+    if (audio_processor_task_stack_ != nullptr) {
+        heap_caps_free(audio_processor_task_stack_);
+    }
+    if (audio_processor_task_buffer_ != nullptr) {
+        heap_caps_free(audio_processor_task_buffer_);
     }
     vEventGroupDelete(event_group_);
 }
@@ -107,6 +132,10 @@ void AfeAudioProcessor::Feed(std::vector<int16_t>&& data) {
 }
 
 void AfeAudioProcessor::Start() {
+    if (audio_processor_task_ == nullptr) {
+        ESP_LOGE(TAG, "Cannot start audio processor: task was not created");
+        return;
+    }
     xEventGroupSetBits(event_group_, PROCESSOR_RUNNING);
 }
 
@@ -121,7 +150,7 @@ void AfeAudioProcessor::Stop() {
 }
 
 bool AfeAudioProcessor::IsRunning() {
-    return xEventGroupGetBits(event_group_) & PROCESSOR_RUNNING;
+    return audio_processor_task_ != nullptr && (xEventGroupGetBits(event_group_) & PROCESSOR_RUNNING);
 }
 
 void AfeAudioProcessor::OnOutput(std::function<void(std::vector<int16_t>&& data)> callback) {

@@ -646,6 +646,10 @@ void AudioService::EnableVoiceProcessing(bool enable) {
             }
         }
         audio_processor_->Start();
+        if (!audio_processor_->IsRunning()) {
+            ESP_LOGE(TAG, "Failed to start voice processing");
+            return;
+        }
         xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_PROCESSOR_RUNNING);
     } else {
         audio_processor_->Stop();

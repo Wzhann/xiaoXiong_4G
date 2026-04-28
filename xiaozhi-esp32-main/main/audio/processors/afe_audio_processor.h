@@ -41,6 +41,9 @@ private:
     std::vector<int16_t> input_buffer_;
     std::mutex input_buffer_mutex_;
     std::vector<int16_t> output_buffer_;
+    TaskHandle_t audio_processor_task_ = nullptr;
+    StaticTask_t* audio_processor_task_buffer_ = nullptr;
+    StackType_t* audio_processor_task_stack_ = nullptr;
 
     void AudioProcessorTask();
 };
