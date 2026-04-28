@@ -667,7 +667,7 @@ private:
             .ledc_channel = LEDC_CHANNEL_0,
 
             .pixel_format = PIXFORMAT_RGB565,
-            .frame_size = FRAMESIZE_VGA,
+            .frame_size = FRAMESIZE_QVGA,
             .jpeg_quality = 12,
             .fb_count = 1,
             .fb_location = CAMERA_FB_IN_PSRAM,
@@ -718,7 +718,7 @@ public:
     // }
     virtual AudioCodec* GetAudioCodec() override {
         static Es8311AudioCodec audio_codec(
-            i2c_bus_, I2C_NUM_1, AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
+            i2c_bus_, I2C_NUM_0, AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
             AUDIO_I2S_GPIO_MCLK, AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT,
             AUDIO_I2S_GPIO_DIN, AUDIO_CODEC_GPIO_PA, AUDIO_CODEC_ES8311_ADDR, false);
         return &audio_codec;
