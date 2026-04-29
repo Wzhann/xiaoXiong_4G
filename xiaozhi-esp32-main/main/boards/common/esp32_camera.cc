@@ -233,7 +233,6 @@ std::string Esp32Camera::Explain(const std::string &question) {
     multipart_footer += "\r\n--" + boundary + "--\r\n";
 
     size_t content_length = question_field.size() + file_header.size() + jpeg_data.size() + multipart_footer.size();
-    size_t total_sent = jpeg_data.size();
 
     http->SetTimeout(8000);
     http->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());
@@ -242,10 +241,7 @@ std::string Esp32Camera::Explain(const std::string &question) {
         http->SetHeader("Authorization", "Bearer " + explain_token_);
     }
     http->SetHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
-    http->SetHeader("Content-Length", std::to_string(content_length));
     http->SetKeepAlive(false);
-    // Mark the request as having a body so HttpClient does not switch to chunked mode.
-    http->SetContent(std::string());
     ESP_LOGI(TAG, "Opening explain URL, jpeg=%u bytes, body=%u bytes", (unsigned)jpeg_data.size(), (unsigned)content_length);
     if (!http->Open("POST", explain_url_)) {
         ESP_LOGE(TAG, "Failed to connect to explain URL");
@@ -270,7 +266,8 @@ std::string Esp32Camera::Explain(const std::string &question) {
     if (!write_all(question_field.data(), question_field.size()) ||
         !write_all(file_header.data(), file_header.size()) ||
         !write_all(jpeg_data.data(), jpeg_data.size()) ||
-        !write_all(multipart_footer.data(), multipart_footer.size())) {
+        !write_all(multipart_footer.data(), multipart_footer.size()) ||
+        http->Write(nullptr, 0) < 0) {
         http->Close();
         ESP_LOGE(TAG, "Failed to upload photo body");
         throw std::runtime_error("Failed to upload photo body");
@@ -278,7 +275,7 @@ std::string Esp32Camera::Explain(const std::string &question) {
     ESP_LOGI(TAG, "Photo body uploaded, waiting for response");
 
     int status_code = http->GetStatusCode();
-    ESP_LOGI(TAG, "Uploaded photo payload: %u bytes, status=%d", (unsigned)total_sent, status_code);
+    ESP_LOGI(TAG, "Uploaded photo payload: %u bytes, status=%d", (unsigned)content_length, status_code);
     if (status_code != 200) {
         std::string error_body = http->ReadAll();
         http->Close();
@@ -291,6 +288,6 @@ std::string Esp32Camera::Explain(const std::string &question) {
 
     size_t remain_stack_size = uxTaskGetStackHighWaterMark(nullptr);
     ESP_LOGI(TAG, "Explain image size=%dx%d, compressed size=%d, remain stack size=%d, question=%s\n%s",
-             current_fb_->width, current_fb_->height, (int)total_sent, (int)remain_stack_size, question.c_str(), result.c_str());
+             current_fb_->width, current_fb_->height, (int)jpeg_data.size(), (int)remain_stack_size, question.c_str(), result.c_str());
     return result;
 }

@@ -5,11 +5,11 @@
 #include "config.h"
 #include "display/dual_eye_render.h"
 #include "display/lcd_display.h"
+#include "dual_network_board.h"
 #include "esp32_camera.h"
 #include "esp_lcd_gc9d01n.h"
 #include "eye_display.h"
 #include "i2c_device.h"
-#include "wifi_board.h"
 
 #include <driver/i2c_master.h>
 #include <driver/uart.h>
@@ -391,7 +391,7 @@ static void ClearPanelToBlack(esp_lcd_panel_handle_t panel) {
     }
 }
 
-class XiaoXiong4GBoard : public WifiBoard {
+class XiaoXiong4GBoard : public DualNetworkBoard {
 private:
     i2c_master_bus_handle_t i2c_bus_;
 
@@ -691,16 +691,27 @@ private:
     void InitializeButtons() {
         boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
-            if (app.GetDeviceState() == kDeviceStateStarting) {
-                EnterWifiConfigMode();
+            if (GetNetworkType() == NetworkType::WIFI &&
+                app.GetDeviceState() == kDeviceStateStarting) {
+                auto& wifi_board = static_cast<WifiBoard&>(GetCurrentBoard());
+                wifi_board.EnterWifiConfigMode();
                 return;
             }
             app.ToggleChatState();
         });
+        boot_button_.OnDoubleClick([this]() {
+            auto& app = Application::GetInstance();
+            if (app.GetDeviceState() == kDeviceStateStarting ||
+                app.GetDeviceState() == kDeviceStateWifiConfiguring) {
+                SwitchNetworkType();
+            }
+        });
     }
 
 public:
-    XiaoXiong4GBoard() : boot_button_(BOOT_BUTTON_GPIO) {
+    XiaoXiong4GBoard()
+        : DualNetworkBoard(ML307_TX_PIN, ML307_RX_PIN, ML307_DTR_PIN),
+          boot_button_(BOOT_BUTTON_GPIO) {
         InitializeI2c();
         I2cDetect();
         InitializeCamera();

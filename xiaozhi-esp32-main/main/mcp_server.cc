@@ -100,9 +100,12 @@ void McpServer::AddCommonTools() {
     auto camera = board.GetCamera();
     if (camera) {
         AddTool("self.camera.take_photo",
-            "Always remember you have a camera. If the user asks you to see something, use this tool to take a photo and then explain it.\n"
+            "Use this tool whenever the user asks to take a photo, open/use the camera, look/see/check what is in front, "
+            "identify an object, read visible text, or describe the surroundings. Do not answer with a camera failure joke "
+            "before calling this tool.\n"
+            "中文：当用户说“拍照”、“打开相机”、“用摄像头看一下”、“看看前面有什么”、“识别这个/看这个/读一下文字”等请求时，必须调用此工具拍照并解释图片，不要直接闲聊回复。\n"
             "Args:\n"
-            "  `question`: The question that you want to ask about the photo.\n"
+            "  `question`: The user's visual question to answer from the photo. Keep the same language as the user. If the user speaks Chinese and only asks to open the camera or take a photo, use \"请用中文描述你看到的画面内容。\".\n"
             "Return:\n"
             "  A JSON object that provides the photo information.",
             PropertyList({
@@ -116,6 +119,9 @@ void McpServer::AddCommonTools() {
                     throw std::runtime_error("Failed to capture photo");
                 }
                 auto question = properties["question"].value<std::string>();
+                if (question.empty() || question == "What is in front of me?") {
+                    question = "请用中文描述你看到的画面内容。";
+                }
                 return camera->Explain(question);
             });
     }

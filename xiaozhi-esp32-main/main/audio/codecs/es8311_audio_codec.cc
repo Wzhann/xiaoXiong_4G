@@ -18,7 +18,7 @@ Es8311AudioCodec::Es8311AudioCodec(void* i2c_master_handle, i2c_port_t i2c_port,
     pa_pin_ = pa_pin;
     pa_inverted_ = pa_inverted;
 #ifdef CONFIG_BOARD_TYPE_XIAOXIONG_4G
-    input_gain_ = 28;
+    input_gain_ = 30;
 #else
     input_gain_ = 30;
 #endif
