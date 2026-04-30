@@ -567,8 +567,8 @@ private:
         io_config.cs_gpio_num = GC9A01_SPI1_LCD_GPIO_CS;
         io_config.dc_gpio_num = GC9A01_SPI1_LCD_GPIO_DC;
         io_config.spi_mode = 0;
-        io_config.pclk_hz = 40 * 1000 * 1000;
-        io_config.trans_queue_depth = 2;
+        io_config.pclk_hz = GC9A01_LCD_PIXEL_CLK_HZ;
+        io_config.trans_queue_depth = 1;
         io_config.lcd_cmd_bits = 8;
         io_config.lcd_param_bits = 8;
         ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(GC9A01_LCD_SPI1_NUM, &io_config, &panel_io_1_));
@@ -592,8 +592,8 @@ private:
         io_config.cs_gpio_num = GC9A01_SPI2_LCD_GPIO_CS;
         io_config.dc_gpio_num = GC9A01_SPI2_LCD_GPIO_DC;
         io_config.spi_mode = 0;
-        io_config.pclk_hz = 40 * 1000 * 1000;
-        io_config.trans_queue_depth = 2;
+        io_config.pclk_hz = GC9A01_LCD_PIXEL_CLK_HZ;
+        io_config.trans_queue_depth = 1;
         io_config.lcd_cmd_bits = 8;
         io_config.lcd_param_bits = 8;
         ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(GC9A01_LCD_SPI2_NUM, &io_config, &panel_io_2_));

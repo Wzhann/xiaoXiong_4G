@@ -28,11 +28,11 @@ namespace {
 
 // Eye layout tuning.
 // These are the main values you may want to adjust later.
-#define EYE_RENDER_WIDTH 96
-#define EYE_RENDER_HEIGHT 96
-#define LEFT_EYE_RENDER_OFFSET_X ((((160 - EYE_RENDER_WIDTH) / 2) - 30))
-#define RIGHT_EYE_RENDER_OFFSET_X ((((160 - EYE_RENDER_WIDTH) / 2) + 30))
-#define EYE_RENDER_OFFSET_Y ((160 - EYE_RENDER_HEIGHT) / 2 + 5)
+#define EYE_RENDER_WIDTH 120
+#define EYE_RENDER_HEIGHT 120
+#define LEFT_EYE_RENDER_OFFSET_X 0
+#define RIGHT_EYE_RENDER_OFFSET_X (160 - EYE_RENDER_WIDTH)
+#define EYE_RENDER_OFFSET_Y ((160 - EYE_RENDER_HEIGHT) / 2)
 #define EYE_LEFT_SHIFT (-10)
 #define EYE_RIGHT_SHIFT (10)
 #define EYE_PUPIL_MOVE_X_MIN (-60)
@@ -125,7 +125,7 @@ uint16_t old_iris = (IRIS_MIN + IRIS_MAX) / 2;
 uint16_t new_iris = (IRIS_MIN + IRIS_MAX) / 2;
 uint16_t* dma_black_line = nullptr;
 uint16_t* dma_border_block = nullptr;
-uint16_t* dma_line_buf[2] = {nullptr, nullptr};
+uint16_t* dma_line_buf[2][2] = {{nullptr, nullptr}, {nullptr, nullptr}};
 
 uint16_t* alloc_dma_pixels(size_t pixels, bool clear = false) {
     uint16_t* buffer = static_cast<uint16_t*>(heap_caps_aligned_alloc(
@@ -154,19 +154,20 @@ uint16_t* get_dma_border_block() {
     return dma_border_block;
 }
 
-uint16_t* get_dma_line_buffer(size_t index) {
-    if (index >= 2) {
+uint16_t* get_dma_line_buffer(size_t panel_index, size_t buffer_index) {
+    if (panel_index >= 2 || buffer_index >= 2) {
         return nullptr;
     }
-    if (dma_line_buf[index] == nullptr) {
-        dma_line_buf[index] = alloc_dma_pixels(kLineBufferPixels);
+    if (dma_line_buf[panel_index][buffer_index] == nullptr) {
+        dma_line_buf[panel_index][buffer_index] = alloc_dma_pixels(kLineBufferPixels);
     }
-    return dma_line_buf[index];
+    return dma_line_buf[panel_index][buffer_index];
 }
 
 bool ensure_dma_buffers() {
     return get_dma_black_line() != nullptr && get_dma_border_block() != nullptr &&
-           get_dma_line_buffer(0) != nullptr && get_dma_line_buffer(1) != nullptr;
+           get_dma_line_buffer(0, 0) != nullptr && get_dma_line_buffer(0, 1) != nullptr &&
+           get_dma_line_buffer(1, 0) != nullptr && get_dma_line_buffer(1, 1) != nullptr;
 }
 
 void clear_panel(esp_lcd_panel_handle_t panel) {
@@ -224,14 +225,15 @@ void clear_eye_border(esp_lcd_panel_handle_t panel, uint16_t render_offset_x) {
     }
 }
 
-void draw_eye_single(esp_lcd_panel_handle_t panel, uint16_t render_offset_x, uint32_t iScale,
-                     int32_t scleraX, uint32_t scleraY, uint32_t uT, uint32_t lT) {
+void draw_eye_single(esp_lcd_panel_handle_t panel, size_t panel_index, uint16_t render_offset_x,
+                     uint32_t iScale, int32_t scleraX, uint32_t scleraY, uint32_t uT,
+                     uint32_t lT) {
     uint32_t scleraXsave = scleraX;
     int16_t irisYBase = scleraY - (kScleraHeight - kIrisHeight) / 2;
 
     uint16_t* line_buf[2];
-    line_buf[0] = get_dma_line_buffer(0);
-    line_buf[1] = get_dma_line_buffer(1);
+    line_buf[0] = get_dma_line_buffer(panel_index, 0);
+    line_buf[1] = get_dma_line_buffer(panel_index, 1);
     if (line_buf[0] == nullptr || line_buf[1] == nullptr) {
         return;
     }
@@ -418,10 +420,10 @@ void frame_impl(esp_lcd_panel_handle_t panel1, esp_lcd_panel_handle_t panel2, ui
         return value;
     };
 
-    draw_eye_single(panel1, kLeftRenderOffsetX, iScale, clamp_x(left_eye_x), clamp_y(left_eye_y), n,
-                    l_threshold);
-    draw_eye_single(panel2, kRightRenderOffsetX, iScale, clamp_x(right_eye_x), clamp_y(right_eye_y),
-                    n, l_threshold);
+    draw_eye_single(panel1, 0, kLeftRenderOffsetX, iScale, clamp_x(left_eye_x),
+                    clamp_y(left_eye_y), n, l_threshold);
+    draw_eye_single(panel2, 1, kRightRenderOffsetX, iScale, clamp_x(right_eye_x),
+                    clamp_y(right_eye_y), n, l_threshold);
 }
 
 void split_impl(esp_lcd_panel_handle_t panel1, esp_lcd_panel_handle_t panel2, int16_t startValue,
