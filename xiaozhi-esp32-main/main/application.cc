@@ -807,7 +807,9 @@ void Application::HandleWakeWordDetectedEvent() {
 
 void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
     // Check state again in case it was changed during scheduling
-    if (GetDeviceState() != kDeviceStateConnecting) {
+    auto state = GetDeviceState();
+    if (state != kDeviceStateConnecting &&
+        !(state == kDeviceStateIdle && protocol_->IsAudioChannelOpened())) {
         return;
     }
 
@@ -1033,6 +1035,48 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
             }
         });
     }
+}
+
+void Application::SendTextToAssistant(const std::string& text) {
+    Schedule([this, text]() {
+        if (!protocol_) {
+            ESP_LOGE(TAG, "Protocol not initialized");
+            return;
+        }
+
+        auto state = GetDeviceState();
+        if (state == kDeviceStateStarting || state == kDeviceStateWifiConfiguring ||
+            state == kDeviceStateActivating || state == kDeviceStateUpgrading ||
+            state == kDeviceStateAudioTesting || state == kDeviceStateFatalError) {
+            ESP_LOGW(TAG, "Ignore text prompt in state: %d", static_cast<int>(state));
+            return;
+        }
+
+        auto display = Board::GetInstance().GetDisplay();
+        display->SetChatMessage("user", text.c_str());
+
+        if (state == kDeviceStateSpeaking) {
+            AbortSpeaking(kAbortReasonNone);
+            SetDeviceState(kDeviceStateIdle);
+        } else if (state == kDeviceStateListening) {
+            protocol_->SendStopListening();
+            SetDeviceState(kDeviceStateIdle);
+        }
+
+        if (!protocol_->IsAudioChannelOpened()) {
+            SetDeviceState(kDeviceStateConnecting);
+            if (!protocol_->OpenAudioChannel()) {
+                SetDeviceState(kDeviceStateIdle);
+                return;
+            }
+        }
+
+        listening_mode_ = GetDefaultListeningMode();
+        protocol_->SendTextToAssistant(text);
+        if (GetDeviceState() == kDeviceStateConnecting) {
+            SetDeviceState(kDeviceStateIdle);
+        }
+    });
 }
 
 bool Application::CanEnterSleepMode() {

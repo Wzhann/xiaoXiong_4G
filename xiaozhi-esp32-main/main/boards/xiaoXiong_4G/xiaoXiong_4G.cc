@@ -10,6 +10,7 @@
 #include "esp_lcd_gc9d01n.h"
 #include "eye_display.h"
 #include "i2c_device.h"
+#include "mcp_server.h"
 
 #include <driver/i2c_master.h>
 #include <driver/uart.h>
@@ -18,7 +19,9 @@
 #include <esp_lcd_panel_ops.h>
 #include <esp_log.h>
 #include <esp_timer.h>
+#include <cJSON.h>
 #include <freertos/queue.h>
+#include <string>
 
 #define TAG "xiaoXiong_4G"
 
@@ -43,6 +46,7 @@ constexpr uint8_t kSlaveTail1 = 'B';
 constexpr uint8_t kCmdServoControl = 0x01;
 constexpr uint8_t kCmdServoAck = 0x00;
 constexpr uint8_t kCmdSensorState = 0x01;
+constexpr uint8_t kCmdBodyDetect = 0x03;
 
 enum ToyServoId : uint8_t {
     kServoLeftLeg = 1,
@@ -82,6 +86,8 @@ static bool g_sensor_forehead = false;
 static bool g_sensor_left_cheek = false;
 static bool g_sensor_right_cheek = false;
 static uint8_t g_sensor_raw_bits = 0;
+static bool g_body_detected = false;
+static bool g_prev_body_detected = false;
 // static QueueHandle_t g_servo_action_queue = nullptr;
 static QueueHandle_t g_servo_action_queues[kServoCount] = {nullptr};
 static TaskHandle_t g_servo_task_handles[kServoCount] = {nullptr};
@@ -90,11 +96,15 @@ static bool g_servo_busy[kServoCount] = {false};
 static TaskHandle_t g_toy_sensor_task_handle = nullptr;
 static uint8_t g_prev_sensor_bits = 0;
 static int64_t g_sensor_last_trigger_us[8] = {0};
+static int64_t g_body_detect_last_trigger_us = 0;
 static int64_t g_last_sensor_log_time_us = 0;
 static bool g_toy_uart_initialized = false;
 static constexpr size_t kToyProtocolFrameSize = 8;
 static constexpr int64_t kSensorLogIntervalUs = 5 * 1000 * 1000;
 static constexpr int64_t kSensorDebounceUs = 500 * 1000;
+static constexpr int64_t kToySensorStartupDelayUs = 5 * 1000 * 1000;
+static constexpr int64_t kTouchPromptCooldownUs = 2 * 1000 * 1000;
+static int64_t g_touch_prompt_last_trigger_us = 0;
 
 size_t ServoIndex(uint8_t servo_id) { return static_cast<size_t>(servo_id - 1); }
 
@@ -102,30 +112,63 @@ bool IsValidServoId(uint8_t servo_id) {
     return servo_id >= kServoLeftLeg && servo_id <= kServoRightArm;
 }
 
-const std::string_view& GetServoVoice(uint8_t servo_id) {
-    switch (servo_id) {
-        case kServoLeftLeg:
-            return Lang::Sounds::OGG_1;
-        case kServoRightLeg:
-            return Lang::Sounds::OGG_2;
-        case kServoTail:
-            return Lang::Sounds::OGG_3;
-        case kServoHead:
-            return Lang::Sounds::OGG_4;
-        case kServoLeftArm:
-            return Lang::Sounds::OGG_5;
-        case kServoRightArm:
-            return Lang::Sounds::OGG_6;
-        default:
-            return Lang::Sounds::OGG_POPUP;
+bool IsToySensorStartupDelayElapsed() { return esp_timer_get_time() >= kToySensorStartupDelayUs; }
+
+void AppendTouchedPart(std::string& parts, const char* part) {
+    if (!parts.empty()) {
+        parts += "和";
     }
+    parts += part;
 }
 
-void PlayTouchVoiceForServo(uint8_t servo_id) {
-    if (!IsValidServoId(servo_id)) {
+std::string BuildTouchedPartsText(uint8_t sensor_bits) {
+    std::string parts;
+    if (sensor_bits & (1 << kSensorLeftLeg)) {
+        AppendTouchedPart(parts, "左脚");
+    }
+    if (sensor_bits & (1 << kSensorRightLeg)) {
+        AppendTouchedPart(parts, "右脚");
+    }
+    if (sensor_bits & (1 << kSensorLeftHand)) {
+        AppendTouchedPart(parts, "左手");
+    }
+    if (sensor_bits & (1 << kSensorRightHand)) {
+        AppendTouchedPart(parts, "右手");
+    }
+    if (sensor_bits & (1 << kSensorBelly)) {
+        AppendTouchedPart(parts, "肚子");
+    }
+    if (sensor_bits & (1 << kSensorLeftCheek)) {
+        AppendTouchedPart(parts, "左脸");
+    }
+    if (sensor_bits & (1 << kSensorRightCheek)) {
+        AppendTouchedPart(parts, "右脸");
+    }
+    if (sensor_bits & (1 << kSensorForehead)) {
+        AppendTouchedPart(parts, "额头");
+    }
+    return parts;
+}
+
+void SendTouchPromptToAssistant(const std::string& touched_parts) {
+    if (touched_parts.empty()) {
         return;
     }
-    Application::GetInstance().PlaySound(GetServoVoice(servo_id));
+
+    const int64_t now_us = esp_timer_get_time();
+    if ((now_us - g_touch_prompt_last_trigger_us) < kTouchPromptCooldownUs) {
+        ESP_LOGI(TAG, "touch prompt cooldown, ignore: %s", touched_parts.c_str());
+        return;
+    }
+    g_touch_prompt_last_trigger_us = now_us;
+
+    std::string prompt = "摸了你的";
+    prompt += touched_parts;
+    Application::GetInstance().SendTextToAssistant(prompt);
+}
+
+void SendBodyDetectPromptToAssistant() {
+    Application::GetInstance().SendTextToAssistant("我靠近了你");
 }
 
 uint8_t ClampAngle(int angle) {
@@ -176,6 +219,54 @@ void EnqueueServoAction(uint8_t servo_id, uint8_t center_angle, uint8_t swing_de
     xQueueSend(queue, &action, 0);
 }
 
+bool RunPandaMotionAction(const std::string& action) {
+    if (action == "greeting" || action == "hello" || action == "wave") {
+        EnqueueServoAction(kServoHead, 90, 18, 260, 1);
+        EnqueueServoAction(kServoRightArm, 90, 32, 240, 3);
+        EnqueueServoAction(kServoTail, 90, 24, 220, 2);
+        return true;
+    }
+
+    if (action == "move" || action == "wiggle") {
+        EnqueueServoAction(kServoLeftLeg, 90, 20, 240, 2);
+        EnqueueServoAction(kServoRightLeg, 90, 20, 240, 2);
+        EnqueueServoAction(kServoLeftArm, 90, 24, 240, 2);
+        EnqueueServoAction(kServoRightArm, 90, 24, 240, 2);
+        EnqueueServoAction(kServoTail, 90, 28, 220, 3);
+        return true;
+    }
+
+    if (action == "comfort" || action == "hug" || action == "soothe") {
+        EnqueueServoAction(kServoHead, 90, 14, 380, 2);
+        EnqueueServoAction(kServoLeftArm, 90, 22, 360, 1);
+        EnqueueServoAction(kServoRightArm, 90, 22, 360, 1);
+        return true;
+    }
+
+    if (action == "happy" || action == "mood_happy") {
+        EnqueueServoAction(kServoHead, 90, 22, 220, 2);
+        EnqueueServoAction(kServoLeftArm, 90, 30, 220, 2);
+        EnqueueServoAction(kServoRightArm, 90, 30, 220, 2);
+        EnqueueServoAction(kServoTail, 90, 30, 180, 4);
+        return true;
+    }
+
+    if (action == "sad" || action == "mood_low" || action == "calm") {
+        EnqueueServoAction(kServoHead, 82, 12, 520, 1);
+        EnqueueServoAction(kServoTail, 84, 12, 520, 1);
+        return true;
+    }
+
+    if (action == "curious" || action == "mood") {
+        EnqueueServoAction(kServoHead, 90, 26, 300, 2);
+        EnqueueServoAction(kServoTail, 90, 20, 300, 2);
+        return true;
+    }
+
+    ESP_LOGW(TAG, "unknown panda motion action: %s", action.c_str());
+    return false;
+}
+
 void UpdateToySensorVariables(uint8_t sensor_bits) {
     g_sensor_raw_bits = sensor_bits;
     g_sensor_left_leg = (sensor_bits >> kSensorLeftLeg) & 0x01;
@@ -191,42 +282,42 @@ void UpdateToySensorVariables(uint8_t sensor_bits) {
 void HandleSensorRisingEdges(uint8_t rising_bits) {
     if (rising_bits & (1 << kSensorLeftLeg)) {
         EnqueueServoAction(kServoLeftLeg, 90, 22, 300, 2);
-        PlayTouchVoiceForServo(kServoLeftLeg);
     }
     if (rising_bits & (1 << kSensorRightLeg)) {
         EnqueueServoAction(kServoRightLeg, 90, 22, 300, 2);
-        PlayTouchVoiceForServo(kServoRightLeg);
     }
     if (rising_bits & (1 << kSensorLeftHand)) {
         EnqueueServoAction(kServoLeftArm, 90, 28, 300, 2);
-        PlayTouchVoiceForServo(kServoLeftArm);
     }
     if (rising_bits & (1 << kSensorRightHand)) {
         EnqueueServoAction(kServoRightArm, 90, 28, 300, 2);
-        PlayTouchVoiceForServo(kServoRightArm);
     }
     if (rising_bits & (1 << kSensorBelly)) {
         EnqueueServoAction(kServoLeftLeg, 90, 22, 300, 2);
         EnqueueServoAction(kServoRightLeg, 90, 22, 300, 2);
         EnqueueServoAction(kServoLeftArm, 90, 28, 300, 2);
         EnqueueServoAction(kServoRightArm, 90, 28, 300, 2);
-        Application::GetInstance().PlaySound(Lang::Sounds::OGG_POPUP);
     }
     if (rising_bits & (1 << kSensorLeftCheek)) {
         EnqueueServoAction(kServoHead, 90, 30, 300, 2);
         EnqueueServoAction(kServoTail, 90, 25, 300, 2);
-        Application::GetInstance().PlaySound(Lang::Sounds::OGG_NIHAO);
     }
     if (rising_bits & (1 << kSensorRightCheek)) {
         EnqueueServoAction(kServoHead, 90, 30, 300, 2);
         EnqueueServoAction(kServoTail, 90, 25, 300, 2);
-        Application::GetInstance().PlaySound(Lang::Sounds::OGG_NIHAO);
     }
     if (rising_bits & (1 << kSensorForehead)) {
         EnqueueServoAction(kServoHead, 90, 20, 300, 2);
         EnqueueServoAction(kServoTail, 90, 25, 300, 2);
-        Application::GetInstance().PlaySound(Lang::Sounds::OGG_NIHAO);
     }
+
+    SendTouchPromptToAssistant(BuildTouchedPartsText(rising_bits));
+}
+
+void HandleBodyDetectRisingEdge() {
+    EnqueueServoAction(kServoHead, 90, 20, 300, 2);
+    EnqueueServoAction(kServoTail, 90, 25, 300, 2);
+    SendBodyDetectPromptToAssistant();
 }
 
 uint8_t FilterDebouncedRisingBits(uint8_t rising_bits) {
@@ -258,10 +349,36 @@ void ProcessSlaveFrame(const uint8_t* frame) {
         UpdateToySensorVariables(sensor_bits);
         if (rising_bits != 0) {
             ESP_LOGI(TAG, "sensor bits=0x%02X rising=0x%02X", sensor_bits, rising_bits);
-            HandleSensorRisingEdges(rising_bits);
+            if (IsToySensorStartupDelayElapsed()) {
+                HandleSensorRisingEdges(rising_bits);
+            } else {
+                ESP_LOGI(TAG, "ignore sensor action during startup delay");
+            }
         }
 
         g_prev_sensor_bits = sensor_bits;
+        return;
+    }
+
+    if (frame[2] == kCmdBodyDetect) {
+        const int64_t now_us = esp_timer_get_time();
+        const bool body_detected = (frame[3] & 0x01) != 0;
+        const bool rising = body_detected && !g_prev_body_detected;
+        if (body_detected != g_body_detected) {
+            ESP_LOGI(TAG, "body detect changed: %u -> %u", g_body_detected ? 1 : 0,
+                     body_detected ? 1 : 0);
+        }
+        g_body_detected = body_detected;
+        g_prev_body_detected = body_detected;
+        if (rising && (now_us - g_body_detect_last_trigger_us) >= kSensorDebounceUs) {
+            g_body_detect_last_trigger_us = now_us;
+            if (IsToySensorStartupDelayElapsed()) {
+                ESP_LOGI(TAG, "body detect rising, trigger servo action");
+                HandleBodyDetectRisingEdge();
+            } else {
+                ESP_LOGI(TAG, "ignore body detect action during startup delay");
+            }
+        }
         return;
     }
 
@@ -353,22 +470,26 @@ void ToySensorUartTask(void* arg) {
         frame[index++] = byte;
         if (index >= kToyProtocolFrameSize) {
             if (frame[6] == kSlaveTail0 && frame[7] == kSlaveTail1) {
-                const uint8_t sensor_bits = frame[3];
                 const int64_t now_us = esp_timer_get_time();
                 if (now_us - g_last_sensor_log_time_us >= kSensorLogIntervalUs) {
                     ESP_LOGI(TAG, "rx frame: %02X %02X %02X %02X %02X %02X %02X %02X", frame[0],
                              frame[1], frame[2], frame[3], frame[4], frame[5], frame[6], frame[7]);
-                    ESP_LOGI(TAG,
-                             "sensors: left_leg=%u right_leg=%u left_hand=%u right_hand=%u "
-                             "belly=%u left_cheek=%u right_cheek=%u forehead=%u",
-                             (sensor_bits >> kSensorLeftLeg) & 0x01,
-                             (sensor_bits >> kSensorRightLeg) & 0x01,
-                             (sensor_bits >> kSensorLeftHand) & 0x01,
-                             (sensor_bits >> kSensorRightHand) & 0x01,
-                             (sensor_bits >> kSensorBelly) & 0x01,
-                             (sensor_bits >> kSensorLeftCheek) & 0x01,
-                             (sensor_bits >> kSensorRightCheek) & 0x01,
-                             (sensor_bits >> kSensorForehead) & 0x01);
+                    if (frame[2] == kCmdSensorState) {
+                        const uint8_t sensor_bits = frame[3];
+                        ESP_LOGI(TAG,
+                                 "sensors: left_leg=%u right_leg=%u left_hand=%u right_hand=%u "
+                                 "belly=%u left_cheek=%u right_cheek=%u forehead=%u",
+                                 (sensor_bits >> kSensorLeftLeg) & 0x01,
+                                 (sensor_bits >> kSensorRightLeg) & 0x01,
+                                 (sensor_bits >> kSensorLeftHand) & 0x01,
+                                 (sensor_bits >> kSensorRightHand) & 0x01,
+                                 (sensor_bits >> kSensorBelly) & 0x01,
+                                 (sensor_bits >> kSensorLeftCheek) & 0x01,
+                                 (sensor_bits >> kSensorRightCheek) & 0x01,
+                                 (sensor_bits >> kSensorForehead) & 0x01);
+                    } else if (frame[2] == kCmdBodyDetect) {
+                        ESP_LOGI(TAG, "body_detect=%u", frame[3] & 0x01);
+                    }
                     g_last_sensor_log_time_us = now_us;
                 }
                 ProcessSlaveFrame(frame);
@@ -708,6 +829,22 @@ private:
         });
     }
 
+    void InitializeTools() {
+        auto& mcp_server = McpServer::GetInstance();
+
+        mcp_server.AddTool(
+            "self.panda.motion",
+            "Control the panda companion toy's servos. Call this tool when the user asks the "
+            "panda to move, greet, wave, comfort them, respond to mood/emotion words, or when "
+            "Chinese phrases like 打招呼、你好、动一下、安慰我、抱抱、开心、难过、心情不好 appear. "
+            "Supported action values: greeting, move, comfort, happy, sad, curious.",
+            PropertyList({Property("action", kPropertyTypeString)}),
+            [](const PropertyList& properties) -> ReturnValue {
+                const std::string& action = properties["action"].value<std::string>();
+                return RunPandaMotionAction(action);
+            });
+    }
+
 public:
     XiaoXiong4GBoard()
         : DualNetworkBoard(ML307_TX_PIN, ML307_RX_PIN, ML307_DTR_PIN),
@@ -717,6 +854,7 @@ public:
         InitializeCamera();
         InitializeDualDisplay();
         InitializeToySensorServo();
+        InitializeTools();
         InitializeButtons();
     }
 
@@ -745,6 +883,35 @@ public:
             return &backlight;
         }
         return nullptr;
+    }
+
+    virtual std::string GetDeviceStatusJson() override {
+        std::string json = DualNetworkBoard::GetDeviceStatusJson();
+        cJSON* root = cJSON_Parse(json.c_str());
+        if (root == nullptr) {
+            return json;
+        }
+
+        cJSON* toy_sensors = cJSON_CreateObject();
+        cJSON_AddNumberToObject(toy_sensors, "raw_bits", g_sensor_raw_bits);
+        cJSON_AddBoolToObject(toy_sensors, "left_leg", g_sensor_left_leg);
+        cJSON_AddBoolToObject(toy_sensors, "right_leg", g_sensor_right_leg);
+        cJSON_AddBoolToObject(toy_sensors, "left_hand", g_sensor_left_hand);
+        cJSON_AddBoolToObject(toy_sensors, "right_hand", g_sensor_right_hand);
+        cJSON_AddBoolToObject(toy_sensors, "belly", g_sensor_belly);
+        cJSON_AddBoolToObject(toy_sensors, "left_cheek", g_sensor_left_cheek);
+        cJSON_AddBoolToObject(toy_sensors, "right_cheek", g_sensor_right_cheek);
+        cJSON_AddBoolToObject(toy_sensors, "forehead", g_sensor_forehead);
+        cJSON_AddBoolToObject(toy_sensors, "body_detected", g_body_detected);
+        cJSON_AddItemToObject(root, "toy_sensors", toy_sensors);
+
+        char* json_str = cJSON_PrintUnformatted(root);
+        if (json_str != nullptr) {
+            json.assign(json_str);
+            cJSON_free(json_str);
+        }
+        cJSON_Delete(root);
+        return json;
     }
 };
 
