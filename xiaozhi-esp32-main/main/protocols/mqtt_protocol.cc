@@ -164,6 +164,10 @@ bool MqttProtocol::SendText(const std::string& text) {
 }
 
 bool MqttProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
+    if (audio_suspended_) {
+        return true;
+    }
+
     std::lock_guard<std::mutex> lock(channel_mutex_);
     if (udp_ == nullptr) {
         return false;
@@ -187,6 +191,11 @@ bool MqttProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
     }
 
     return udp_->Send(encrypted) > 0;
+}
+
+void MqttProtocol::SetAudioSuspended(bool suspended) {
+    audio_suspended_ = suspended;
+    ESP_LOGI(TAG, "%s audio UDP sending", suspended ? "Suspending" : "Resuming");
 }
 
 void MqttProtocol::CloseAudioChannel(bool send_goodbye) {

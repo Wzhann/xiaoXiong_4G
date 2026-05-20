@@ -251,6 +251,31 @@ void Application::Run() {
     }
 }
 
+void Application::BeginCameraOperation() {
+    ESP_LOGI(TAG, "Pausing audio while camera is running");
+    camera_paused_voice_processing_ = audio_service_.IsAudioProcessorRunning();
+    if (camera_paused_voice_processing_) {
+        audio_service_.EnableVoiceProcessing(false);
+    }
+    while (audio_service_.PopPacketFromSendQueue()) {
+    }
+    if (protocol_) {
+        protocol_->SetAudioSuspended(true);
+    }
+}
+
+void Application::EndCameraOperation() {
+    if (protocol_) {
+        protocol_->SetAudioSuspended(false);
+    }
+    if (camera_paused_voice_processing_ &&
+        GetDeviceState() == kDeviceStateListening) {
+        audio_service_.EnableVoiceProcessing(true);
+    }
+    camera_paused_voice_processing_ = false;
+    ESP_LOGI(TAG, "Audio resumed after camera");
+}
+
 void Application::HandleNetworkConnectedEvent() {
     ESP_LOGI(TAG, "Network connected");
     auto state = GetDeviceState();

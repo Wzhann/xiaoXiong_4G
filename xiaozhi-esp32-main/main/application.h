@@ -113,6 +113,8 @@ public:
     AecMode GetAecMode() const { return aec_mode_; }
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
+    void BeginCameraOperation();
+    void EndCameraOperation();
     
     /**
      * Reset protocol resources (thread-safe)
@@ -141,6 +143,7 @@ private:
     bool aborted_ = false;
     bool assets_version_checked_ = false;
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
+    bool camera_paused_voice_processing_ = false;
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
 

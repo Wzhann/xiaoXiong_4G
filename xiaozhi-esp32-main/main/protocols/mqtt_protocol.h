@@ -30,6 +30,7 @@ public:
 
     bool Start() override;
     bool SendAudio(std::unique_ptr<AudioStreamPacket> packet) override;
+    void SetAudioSuspended(bool suspended) override;
     bool OpenAudioChannel() override;
     void CloseAudioChannel(bool send_goodbye = true) override;
     bool IsAudioChannelOpened() const override;
@@ -52,6 +53,7 @@ private:
     uint32_t local_sequence_;
     uint32_t remote_sequence_;
     esp_timer_handle_t reconnect_timer_;
+    std::atomic<bool> audio_suspended_ = false;
 
     bool StartMqttClient(bool report_error=false);
     void ParseServerHello(const cJSON* root);

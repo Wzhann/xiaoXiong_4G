@@ -114,15 +114,24 @@ void McpServer::AddCommonTools() {
             [camera](const PropertyList& properties) -> ReturnValue {
                 // Lower the priority to do the camera capture
                 TaskPriorityReset priority_reset(1);
+                auto& app = Application::GetInstance();
+                app.BeginCameraOperation();
 
-                if (!camera->Capture()) {
-                    throw std::runtime_error("Failed to capture photo");
+                try {
+                    if (!camera->Capture()) {
+                        throw std::runtime_error("Failed to capture photo");
+                    }
+                    auto question = properties["question"].value<std::string>();
+                    if (question.empty() || question == "What is in front of me?") {
+                        question = "请用中文描述你看到的画面内容。";
+                    }
+                    auto result = camera->Explain(question);
+                    app.EndCameraOperation();
+                    return result;
+                } catch (...) {
+                    app.EndCameraOperation();
+                    throw;
                 }
-                auto question = properties["question"].value<std::string>();
-                if (question.empty() || question == "What is in front of me?") {
-                    question = "请用中文描述你看到的画面内容。";
-                }
-                return camera->Explain(question);
             });
     }
 #endif
