@@ -38,7 +38,7 @@
 
 #define TAG "AudioService"
 
-#ifdef CONFIG_BOARD_TYPE_XIAOXIONG_4G
+#if defined(CONFIG_BOARD_TYPE_XIAOXIONG_4G) || defined(CONFIG_BOARD_TYPE_CAT_TAIL_AND_NECK)
 static void LogXiaoXiongMicLevel(const std::vector<int16_t>& data) {
     static uint32_t counter = 0;
     if (++counter < 100) {
@@ -262,7 +262,7 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
     last_input_time_ = std::chrono::steady_clock::now();
     debug_statistics_.input_count++;
 
-#ifdef CONFIG_BOARD_TYPE_XIAOXIONG_4G
+#if defined(CONFIG_BOARD_TYPE_XIAOXIONG_4G) || defined(CONFIG_BOARD_TYPE_CAT_TAIL_AND_NECK)
     LogXiaoXiongMicLevel(data);
 #endif
 

@@ -17,7 +17,7 @@ Es8311AudioCodec::Es8311AudioCodec(void* i2c_master_handle, i2c_port_t i2c_port,
     output_sample_rate_ = output_sample_rate;
     pa_pin_ = pa_pin;
     pa_inverted_ = pa_inverted;
-#ifdef CONFIG_BOARD_TYPE_XIAOXIONG_4G
+#if defined(CONFIG_BOARD_TYPE_XIAOXIONG_4G) || defined(CONFIG_BOARD_TYPE_CAT_TAIL_AND_NECK)
     input_gain_ = 30;
 #else
     input_gain_ = 30;
@@ -53,7 +53,7 @@ Es8311AudioCodec::Es8311AudioCodec(void* i2c_master_handle, i2c_port_t i2c_port,
     es8311_cfg.codec_mode = ESP_CODEC_DEV_WORK_MODE_BOTH;
     es8311_cfg.pa_pin = pa_pin;
     es8311_cfg.use_mclk = use_mclk;
-#ifdef CONFIG_BOARD_TYPE_XIAOXIONG_4G
+#if defined(CONFIG_BOARD_TYPE_XIAOXIONG_4G) || defined(CONFIG_BOARD_TYPE_CAT_TAIL_AND_NECK)
     es8311_cfg.no_dac_ref = true;
 #endif
     es8311_cfg.hw_gain.pa_voltage = 5.0;

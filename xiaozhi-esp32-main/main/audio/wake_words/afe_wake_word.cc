@@ -149,7 +149,7 @@ void AfeWakeWord::AudioDetectionTask() {
         // Store the wake word data for voice recognition, like who is speaking
         StoreWakeWordData(res->data, res->data_size / sizeof(int16_t));
 
-#ifdef CONFIG_BOARD_TYPE_XIAOXIONG_4G
+#if defined(CONFIG_BOARD_TYPE_XIAOXIONG_4G) || defined(CONFIG_BOARD_TYPE_CAT_TAIL_AND_NECK)
         static uint32_t fetch_counter = 0;
         if (++fetch_counter >= 32 || res->wakeup_state == WAKENET_DETECTED) {
             fetch_counter = 0;

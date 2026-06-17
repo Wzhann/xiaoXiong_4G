@@ -254,6 +254,12 @@ choice BOARD_TYPE
     config BOARD_TYPE_XIAOXIONG_4G
         bool "xiaoXiong_4G"
         depends on IDF_TARGET_ESP32S3
+    config BOARD_TYPE_CAT_TAIL_AND_NECK
+        bool "cat_tailAndNeck"
+        depends on IDF_TARGET_ESP32S3
+    config BOARD_TYPE_TUZI_SD
+        bool "tuzi_SD"
+        depends on IDF_TARGET_ESP32S3
     config BOARD_TYPE_M5STACK_ATOM_S3R_ECHO_BASE
         bool "M5Stack AtomS3R + Echo Base"
         depends on IDF_TARGET_ESP32S3
