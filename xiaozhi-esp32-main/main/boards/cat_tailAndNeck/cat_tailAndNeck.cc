@@ -1,7 +1,9 @@
 #include "action_executor.h"
 #include "action_list.h"
 #include "application.h"
+#include "assets/lang_config.h"
 #include "button.h"
+#include "cat_audio.h"
 #include "codecs/es8311_audio_codec.h"
 #include "config.h"
 #include "led/single_led.h"
@@ -38,8 +40,11 @@ static constexpr ledc_channel_t kServoChannels[kServoCount] = {
     LEDC_CHANNEL_0, LEDC_CHANNEL_1, LEDC_CHANNEL_2, LEDC_CHANNEL_3, LEDC_CHANNEL_4};
 static constexpr gpio_num_t kServoPins[kServoCount] = {SERVO_0_GPIO, SERVO_1_GPIO, SERVO_2_GPIO,
                                                        SERVO_3_GPIO, SERVO_4_GPIO};
-static constexpr const char* kServoNames[kServoCount] = {"Neck0_IO15", "Neck1_IO16", "Tail0_IO17",
-                                                         "Tail1_IO18", "Head_IO8"};
+static constexpr const char* kServoNames[kServoCount] = {"Neck0_IO18", "Neck1_IO17", "Tail0_IO15",
+                                                         "Tail1_IO16", "Head_IO8"};
+
+// Invert: IO18(Neck0), IO17(Neck1), IO8(Head) — 0<->180, matching action_cat recorder
+static constexpr bool kServoInvert[kServoCount] = {true, true, false, false, true};
 
 // Convert angle (0-180) to LEDC duty for 500-2500us pulse
 static uint32_t AngleToDuty(int angle) {
@@ -61,6 +66,8 @@ private:
     int battery_vbat_filtered_mv_ = 0;
     int servo_angle_[kServoCount] = {90, 90, 90, 90, 90};
     bool emote_enabled_ = true;
+    TickType_t last_sound_tick_ = 0;  // sound cooldown to prevent overlap
+    static constexpr uint32_t SOUND_COOLDOWN_MS = 2500;  // wait for current sound to finish
     // 3 independent executors — each group runs its own actions in parallel
     ActionExecutor neck_exec_{GROUP_NECK, "neck"};
     ActionExecutor tail_exec_{GROUP_TAIL, "tail"};
@@ -68,6 +75,8 @@ private:
 
     // ===== Touch button + MPU-6050 gyro =====
     TaskHandle_t touch_task_ = nullptr;
+    SemaphoreHandle_t adc_mutex_ = nullptr;
+    QueueHandle_t cat_sound_queue_ = nullptr;
     bool mpu_ok_ = false;
     bool gyro_actions_enabled_ = true;  // MCP toggle for motion→action
     static constexpr int TOUCH_OVERSAMPLE = 256;
@@ -94,28 +103,346 @@ private:
         return -1;
     }
 
+    // Non-blocking: queue a cat sound for the playback task
+    void TriggerCatSound(cat_sound_type_t type) {
+        if (cat_sound_queue_) {
+            xQueueSend(cat_sound_queue_, &type, 0);  // drop if full
+        }
+    }
+
+    // Dedicated task: waits for sound events and plays PCM through codec
+    void CatSoundTask() {
+        auto* codec = GetAudioCodec();
+        cat_sound_type_t type;
+        while (true) {
+            if (xQueueReceive(cat_sound_queue_, &type, portMAX_DELAY) != pdTRUE)
+                continue;
+
+            codec->EnableOutput(true);
+            size_t total = 0;
+            int16_t* samples = cat_sound_generate(type, AUDIO_OUTPUT_SAMPLE_RATE, &total);
+            if (!samples || !total) continue;
+
+            ESP_LOGI(TAG, "🔊 Cat: %s (%zu samples)", cat_sound_name(type), total);
+            constexpr size_t kChunk = 240;
+            size_t offset = 0;
+            while (offset < total) {
+                size_t chunk = total - offset;
+                if (chunk > kChunk) chunk = kChunk;
+                std::vector<int16_t> buf(samples + offset, samples + offset + chunk);
+                codec->OutputData(buf);
+                offset += chunk;
+                vTaskDelay(pdMS_TO_TICKS(5));
+            }
+            free(samples);
+            ESP_LOGI(TAG, "✅ Done: %s", cat_sound_name(type));
+        }
+    }
+
     int TouchRead() {
         int64_t sum = 0;
+        bool got_lock = (xSemaphoreTake(adc_mutex_, pdMS_TO_TICKS(50)) == pdTRUE);
+        if (!got_lock) {
+            static int lock_fail_cnt = 0;
+            if (++lock_fail_cnt % 100 == 1)
+                ESP_LOGW(TAG, "TouchRead: ADC mutex timeout (#%d)", lock_fail_cnt);
+            return -1;  // skip this cycle
+        }
         for (int i = 0; i < TOUCH_OVERSAMPLE; i++) {
             int raw;
             adc_oneshot_read(adc_handle_, ADC_CHANNEL_4, &raw);
             sum += raw;
         }
+        xSemaphoreGive(adc_mutex_);
         int avg = sum / TOUCH_OVERSAMPLE;
-        int mv;
-        adc_cali_raw_to_voltage(adc_cali_handle_, avg, &mv);
+        int mv = 0;
+        esp_err_t r = adc_cali_raw_to_voltage(adc_cali_handle_, avg, &mv);
+        if (r != ESP_OK) {
+            mv = avg * 3300 / 4096;  // fallback
+        }
+        // Log raw ADC value periodically
+        static int raw_log_tick = 0;
+        if (++raw_log_tick % 50 == 0) {
+            ESP_LOGI(TAG, "ADC raw avg=%d mv=%d code=%d", avg, mv, TouchLookup(mv));
+        }
         return TouchLookup(mv);
     }
 
-    // Touch → action mapping (per group, triggered by touch)
+    // Touch → emotion → audio + action
+    //   SW0 (0x01) = 摸头     → 快乐 (happy)
+    //   SW1 (0x02) = 摸背     → 喜爱 (love/purr)
+    //   SW2 (0x04) = 摸左爪   → 好奇 (curious)
+    //   SW3 (0x08) = 摸右爪   → 惊讶 (surprised)
+    //   SW0+SW1    = 摸头+背  → 快乐强化 (intense happy)
+    //   SW2+SW3    = 摸双爪   → 恐惧 (fear)
+    //   SW0+SW2    = 摸头+左爪 → 悲伤 (sad)
+    //   SW0+SW3    = 摸头+右爪 → 愤怒 (angry)
+    //   SW1+SW2    = 摸背+左爪 → 厌恶 (disgust)
+    //   SW1+SW3    = 摸背+右爪 → 中性 (neutral)
     void OnTouch(int code) {
         if (code <= 0) return;
-        if (code & 0x01) neck_exec_.Run("neck_nod", 0, 1);         // SW0 → neck
-        if (code & 0x02) tail_exec_.Run("tail_wag", 0, 1);         // SW1 → tail
-        if (code & 0x04) head_exec_.Run("head_nod", 0, 1);         // SW2 → head
-        if (code & 0x08) head_exec_.Run("head_shake", 0, 1);       // SW3 → head
-        if (code == 0x03) { StopAllActions(); RunAction("all_happy", 0, 1); }   // 0+1
-        if (code == 0x0C) { StopAllActions(); RunAction("all_dance", 0, 1); }   // 2+3
+
+        // Combo lock: clear queued actions on all 3 groups, wait for running ones to finish
+        neck_exec_.ClearPending();
+        tail_exec_.ClearPending();
+        head_exec_.ClearPending();
+        uint16_t waited = 0;
+        while ((neck_exec_.IsBusy() || tail_exec_.IsBusy() || head_exec_.IsBusy()) && waited < 5000) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            waited += 20;
+        }
+
+        auto& app = Application::GetInstance();
+        auto r = rand;
+        auto pick = [&r](const char* const* list, int n) -> const char* {
+            return list[r() % n];
+        };
+        // Sound cooldown: prevent overlapping, wait for current to finish
+        TickType_t now = xTaskGetTickCount();
+        bool can_play_sound = ((now - last_sound_tick_) * portTICK_PERIOD_MS) >= SOUND_COOLDOWN_MS;
+        auto pickSound = [&](const std::string_view* list, int n) {
+            if (can_play_sound) {
+                auto& picked = list[r() % n];
+                ESP_LOGI(TAG, "🔊 Touch sound: %.*s", (int)picked.size(), picked.data());
+                app.PlaySound(picked);
+                last_sound_tick_ = now;
+            }
+        };
+
+        // ===== Emotion audio pools (ALL from emotion_sorted, 5 per emotion) =====
+        static const std::string_view kHappySounds[] = {
+            Lang::Sounds::OGG_EMOTION_HAPPY_1, Lang::Sounds::OGG_EMOTION_HAPPY_2,
+            Lang::Sounds::OGG_EMOTION_HAPPY_3, Lang::Sounds::OGG_EMOTION_HAPPY_4,
+            Lang::Sounds::OGG_EMOTION_HAPPY_5,
+        };
+        static const std::string_view kSadSounds[] = {
+            Lang::Sounds::OGG_EMOTION_SAD_1, Lang::Sounds::OGG_EMOTION_SAD_2,
+            Lang::Sounds::OGG_EMOTION_SAD_3, Lang::Sounds::OGG_EMOTION_SAD_4,
+            Lang::Sounds::OGG_EMOTION_SAD_5,
+        };
+        static const std::string_view kAngrySounds[] = {
+            Lang::Sounds::OGG_EMOTION_ANGRY_1, Lang::Sounds::OGG_EMOTION_ANGRY_2,
+            Lang::Sounds::OGG_EMOTION_ANGRY_3, Lang::Sounds::OGG_EMOTION_ANGRY_4,
+            Lang::Sounds::OGG_EMOTION_ANGRY_5,
+        };
+        static const std::string_view kFearSounds[] = {
+            Lang::Sounds::OGG_EMOTION_FEAR_1, Lang::Sounds::OGG_EMOTION_FEAR_2,
+            Lang::Sounds::OGG_EMOTION_FEAR_3, Lang::Sounds::OGG_EMOTION_FEAR_4,
+            Lang::Sounds::OGG_EMOTION_FEAR_5,
+        };
+        static const std::string_view kCuriousSounds[] = {
+            Lang::Sounds::OGG_EMOTION_SURPRISE_1, Lang::Sounds::OGG_EMOTION_SURPRISE_2,
+            Lang::Sounds::OGG_EMOTION_SURPRISE_3, Lang::Sounds::OGG_EMOTION_SURPRISE_4,
+            Lang::Sounds::OGG_EMOTION_SURPRISE_5,
+        };
+        static const std::string_view kSurpriseSounds[] = {
+            Lang::Sounds::OGG_EMOTION_SURPRISE_1, Lang::Sounds::OGG_EMOTION_SURPRISE_2,
+            Lang::Sounds::OGG_EMOTION_SURPRISE_3, Lang::Sounds::OGG_EMOTION_SURPRISE_4,
+            Lang::Sounds::OGG_EMOTION_SURPRISE_5,
+        };
+        static const std::string_view kDisgustSounds[] = {
+            Lang::Sounds::OGG_EMOTION_DISGUST_1, Lang::Sounds::OGG_EMOTION_ANGRY_2,
+        };
+        static const std::string_view kNeutralSounds[] = {
+            Lang::Sounds::OGG_EMOTION_NEUTRAL_1, Lang::Sounds::OGG_EMOTION_NEUTRAL_2,
+            Lang::Sounds::OGG_EMOTION_NEUTRAL_3,
+        };
+        // Love/purr → use happy emotion sounds
+        static const std::string_view kPurrSounds[] = {
+            Lang::Sounds::OGG_EMOTION_HAPPY_3, Lang::Sounds::OGG_EMOTION_HAPPY_4,
+            Lang::Sounds::OGG_EMOTION_HAPPY_5, Lang::Sounds::OGG_EMOTION_NEUTRAL_1,
+        };
+
+        constexpr int kHappyN = sizeof(kHappySounds)/sizeof(kHappySounds[0]);
+        constexpr int kSadN = sizeof(kSadSounds)/sizeof(kSadSounds[0]);
+        constexpr int kAngryN = sizeof(kAngrySounds)/sizeof(kAngrySounds[0]);
+        constexpr int kFearN = sizeof(kFearSounds)/sizeof(kFearSounds[0]);
+        constexpr int kCuriousN = sizeof(kCuriousSounds)/sizeof(kCuriousSounds[0]);
+        constexpr int kSurpriseN = sizeof(kSurpriseSounds)/sizeof(kSurpriseSounds[0]);
+        constexpr int kDisgustN = sizeof(kDisgustSounds)/sizeof(kDisgustSounds[0]);
+        constexpr int kNeutralN = sizeof(kNeutralSounds)/sizeof(kNeutralSounds[0]);
+        constexpr int kPurrN = sizeof(kPurrSounds)/sizeof(kPurrSounds[0]);
+
+        switch (code) {
+            case 0x01: { // 摸头 → 快乐 (happy)
+                static const char* necks[] = {
+                    "neck_nod","neck_wave","neck_tilt_left","neck_tilt_right",
+                    "neck_glance_lu","neck_sway","neck_circle",
+                };
+                static const char* tails[] = {
+                    "tail_wag","tail_wag_fast","tail_up","tail_perk",
+                    "tail_bounce","tail_quiver","tail_sway",
+                };
+                static const char* heads[] = {
+                    "head_nod","head_bob","head_sway","head_tilt",
+                    "head_tilt_l","head_tilt_r","head_micro_l","head_micro_r",
+                };
+                neck_exec_.Run(pick(necks,7), 0, 1);
+                tail_exec_.Run(pick(tails,7), 0, 1);
+                head_exec_.Run(pick(heads,8), 0, 1);
+                pickSound(kHappySounds, kHappyN);
+                break;
+            }
+            case 0x02: { // 摸背 → 喜爱 (love/purr)
+                static const char* necks[] = {
+                    "neck_nod_slow","neck_sway","neck_relax","neck_figure8",
+                };
+                static const char* tails[] = {
+                    "tail_sway","tail_wag_slow","tail_curl","tail_scurve",
+                    "tail_rest",
+                };
+                static const char* heads[] = {
+                    "head_calm","head_relax","head_sway","head_tilt",
+                    "head_micro_l",
+                };
+                neck_exec_.Run(pick(necks,4), 0, 2);
+                tail_exec_.Run(pick(tails,5), 0, 2);
+                head_exec_.Run(pick(heads,5), 0, 1);
+                pickSound(kPurrSounds, kPurrN);
+                break;
+            }
+            case 0x04: { // 摸左爪 → 好奇 (curious)
+                static const char* necks[] = {
+                    "neck_curious","neck_glance_lu","neck_tilt_left",
+                    "neck_figure8","neck_stretch",
+                };
+                static const char* tails[] = {
+                    "tail_question","tail_perk","tail_hook","tail_loop",
+                };
+                static const char* heads[] = {
+                    "head_curious","head_glance_l","head_dbl_take",
+                    "head_scan_l","head_tilt_l",
+                };
+                neck_exec_.Run(pick(necks,5), 0, 1);
+                tail_exec_.Run(pick(tails,4), 0, 1);
+                head_exec_.Run(pick(heads,5), 0, 1);
+                pickSound(kCuriousSounds, kCuriousN);
+                break;
+            }
+            case 0x08: { // 摸右爪 → 惊讶 (surprised)
+                static const char* necks[] = {
+                    "neck_stretch","neck_snap_r","neck_fast_shake",
+                    "neck_backward",
+                };
+                static const char* tails[] = {
+                    "tail_up","tail_perk","tail_tremble","tail_bounce",
+                    "tail_flick",
+                };
+                static const char* heads[] = {
+                    "head_dbl_take","head_alert","head_sweep_fast",
+                    "head_stretch",
+                };
+                neck_exec_.Run(pick(necks,4), 0, 1);
+                tail_exec_.Run(pick(tails,5), 0, 1);
+                head_exec_.Run(pick(heads,4), 0, 1);
+                pickSound(kSurpriseSounds, kSurpriseN);
+                break;
+            }
+            case 0x03: { // 摸头+背 → 超级开心 (super happy)
+                StopAllActions();
+                static const char* acts[] = {
+                    "all_happy","all_greeting","all_playful","all_dance",
+                    "all_head_tilt",
+                };
+                RunAllAction(pick(acts,5), 0, 1);
+                pickSound(kHappySounds, kHappyN);
+                break;
+            }
+            case 0x0C: { // 摸双爪 → 恐惧 (fear)
+                static const char* necks[] = {
+                    "neck_shake","neck_fast_shake","neck_backward",
+                    "neck_bow",
+                };
+                static const char* tails[] = {
+                    "tail_tremble","tail_curl","tail_droop",
+                };
+                static const char* heads[] = {
+                    "head_shake","head_tilt_l","head_tilt_r",
+                };
+                neck_exec_.Run(pick(necks,4), 0, 1);
+                tail_exec_.Run(pick(tails,3), 0, 1);
+                head_exec_.Run(pick(heads,3), 0, 1);
+                pickSound(kFearSounds, kFearN);
+                break;
+            }
+            case 0x05: { // 摸头+左爪 → 悲伤 (sad)
+                static const char* necks[] = {
+                    "neck_bow","neck_nod_slow","neck_forward",
+                    "neck_lean_fwd",
+                };
+                static const char* tails[] = {
+                    "tail_droop","tail_curl","tail_sway","tail_rest",
+                };
+                static const char* heads[] = {
+                    "head_tilt_l","head_left","head_calm","head_scan_l",
+                };
+                neck_exec_.Run(pick(necks,4), 0, 2);
+                tail_exec_.Run(pick(tails,4), 0, 2);
+                head_exec_.Run(pick(heads,4), 0, 1);
+                pickSound(kSadSounds, kSadN);
+                break;
+            }
+            case 0x09: { // 摸头+右爪 → 愤怒 (angry)
+                static const char* necks[] = {
+                    "neck_fast_shake","neck_snap_r","neck_shake",
+                };
+                static const char* tails[] = {
+                    "tail_wag_fast","tail_flick","tail_swish","tail_spiral",
+                };
+                static const char* heads[] = {
+                    "head_shake","head_sweep_fast","head_sweep",
+                };
+                neck_exec_.Run(pick(necks,3), 0, 2);
+                tail_exec_.Run(pick(tails,4), 0, 2);
+                head_exec_.Run(pick(heads,3), 0, 1);
+                pickSound(kAngrySounds, kAngryN);
+                break;
+            }
+            case 0x06: { // 摸背+左爪 → 厌恶 (disgust)
+                static const char* necks[] = {
+                    "neck_shake","neck_backward","neck_snap_r",
+                };
+                static const char* tails[] = {
+                    "tail_flick","tail_swish","tail_droop",
+                };
+                static const char* heads[] = {
+                    "head_sweep","head_shake","head_sweep_fast",
+                    "head_confused",
+                };
+                neck_exec_.Run(pick(necks,3), 0, 1);
+                tail_exec_.Run(pick(tails,3), 0, 1);
+                head_exec_.Run(pick(heads,4), 0, 1);
+                pickSound(kDisgustSounds, kDisgustN);
+                break;
+            }
+            case 0x0A: { // 摸背+右爪 → 中性 (neutral)
+                static const char* necks[] = {
+                    "neck_nod_slow","neck_sway","neck_relax",
+                };
+                static const char* tails[] = {
+                    "tail_sway","tail_wag_slow","tail_rest",
+                };
+                static const char* heads[] = {
+                    "head_calm","head_left","head_right",
+                    "head_scan_l","head_scan_r",
+                };
+                neck_exec_.Run(pick(necks,3), 0, 1);
+                tail_exec_.Run(pick(tails,3), 0, 1);
+                head_exec_.Run(pick(heads,5), 0, 1);
+                pickSound(kNeutralSounds, kNeutralN);
+                break;
+            }
+            default: { // 多点/其他 → 慢眨眼示好
+                static const char* necks[] = {"neck_sway","neck_nod_slow","neck_relax"};
+                static const char* tails[] = {"tail_sway","tail_wag_slow"};
+                static const char* heads[] = {"head_calm","head_sway"};
+                neck_exec_.Run(pick(necks,3), 0, 1);
+                tail_exec_.Run(pick(tails,2), 0, 1);
+                head_exec_.Run(pick(heads,2), 0, 1);
+                pickSound(kNeutralSounds, kNeutralN);
+                break;
+            }
+        }
     }
 
     // Motion detection task (touch + MPU-6050)
@@ -131,11 +458,23 @@ private:
 
         uint32_t last_motion_ms = 0;
         int last_touch = -1, stable_cnt = 0, active_touch = -1;
-        TickType_t last_wake = xTaskGetTickCount();
-
         while (true) {
             // 1. Read touch buttons (every 20ms)
             int touch = TouchRead();
+
+            // Debug: log every 50 cycles (~1s)
+            static int dbg_tick = 0;
+            dbg_tick++;
+            if (dbg_tick % 50 == 0) {
+                ESP_LOGI(TAG, "Touch dbg: read=%d last=%d stable=%d active=%d", touch, last_touch, stable_cnt, active_touch);
+            }
+
+            if (touch < 0) {
+                // ADC read failed (mutex timeout), skip this cycle
+                vTaskDelay(pdMS_TO_TICKS(20));
+                continue;
+            }
+
             if (touch == last_touch) {
                 stable_cnt++;
                 if (active_touch < 0 && touch > 0 && stable_cnt >= 5) {
@@ -146,6 +485,7 @@ private:
                 } else if (active_touch >= 0 && touch == 0 && stable_cnt >= 8) {
                     // Released
                     active_touch = -1;
+                    ESP_LOGI(TAG, "Touch released");
                 }
             } else {
                 stable_cnt = 1;
@@ -155,8 +495,8 @@ private:
             // 2. MPU-6050: motion detect every 3rd cycle, raw log every 500ms
             static int tick = 0;
             tick++;
-            if (mpu_ok_ && tick % 25 == 0) {
-                mpu6050_print_raw();  // every ~500ms
+            if (mpu_ok_ && tick % 150 == 0) {
+                mpu6050_print_raw();  // every ~3s
             }
             if (mpu_ok_ && tick % 3 == 0) {
                 mpu6050_motion_t motion = mpu6050_detect_motion();
@@ -166,15 +506,89 @@ private:
                         last_motion_ms = now;
                         ESP_LOGI(TAG, "🌀 Motion: %s | Orient: %s", mpu6050_motion_name(motion),
                                  mpu6050_orient_name(mpu6050_get_orientation()));
-                        // Motion → action (when enabled)
+                        // Motion → action (when enabled), randomized for variety + sound
                         if (gyro_actions_enabled_) {
+                            auto pick = [](const char* const* list, int n) -> const char* {
+                                return list[rand() % n];
+                            };
+                            auto pickSound = [](const std::string_view* list, int n) {
+                                Application::GetInstance().PlaySound(list[rand() % n]);
+                            };
+                            // Sound pools (all from emotion_sorted)
+                            static const std::string_view kCuriousSounds2[] = {
+                                Lang::Sounds::OGG_EMOTION_SURPRISE_1, Lang::Sounds::OGG_EMOTION_SURPRISE_2,
+                                Lang::Sounds::OGG_EMOTION_SURPRISE_3, Lang::Sounds::OGG_EMOTION_SURPRISE_4,
+                                Lang::Sounds::OGG_EMOTION_SURPRISE_5,
+                            };
+                            static const std::string_view kSurpriseSounds2[] = {
+                                Lang::Sounds::OGG_EMOTION_SURPRISE_1, Lang::Sounds::OGG_EMOTION_SURPRISE_2,
+                                Lang::Sounds::OGG_EMOTION_FEAR_1, Lang::Sounds::OGG_EMOTION_FEAR_2,
+                                Lang::Sounds::OGG_EMOTION_FEAR_3,
+                            };
+                            static const std::string_view kPurrSounds[] = {
+                                Lang::Sounds::OGG_EMOTION_HAPPY_3, Lang::Sounds::OGG_EMOTION_HAPPY_4,
+                                Lang::Sounds::OGG_EMOTION_HAPPY_5, Lang::Sounds::OGG_EMOTION_NEUTRAL_1,
+                            };
+                            static const std::string_view kSadSounds[] = {
+                                Lang::Sounds::OGG_EMOTION_SAD_1, Lang::Sounds::OGG_EMOTION_SAD_2,
+                                Lang::Sounds::OGG_EMOTION_SAD_3,
+                            };
+                            static constexpr int kC2N = sizeof(kCuriousSounds2)/sizeof(kCuriousSounds2[0]);
+                            static constexpr int kS2N = sizeof(kSurpriseSounds2)/sizeof(kSurpriseSounds2[0]);
+                            static constexpr int kPN = sizeof(kPurrSounds)/sizeof(kPurrSounds[0]);
+                            static constexpr int kSN = sizeof(kSadSounds)/sizeof(kSadSounds[0]);
+
                             switch (motion) {
-                                case MOTION_PICKED_UP: RunAction("all_greeting", 0, 1); break;
-                                case MOTION_SHAKEN:    RunAction("all_dance", 0, 1); break;
-                                case MOTION_FLIPPED:   RunAction("all_curious", 0, 1); break;
-                                case MOTION_PETTING:   neck_exec_.Run("neck_wave", 0, 2);
-                                                       tail_exec_.Run("tail_wag", 0, 2); break;
-                                case MOTION_DROPPED:   RunAction("all_sleep", 0, 1); break;
+                                case MOTION_PICKED_UP: {
+                                    static const char* pk_neck[] = {"neck_nod","neck_left","neck_right","neck_wave","neck_curious","neck_figure8"};
+                                    static const char* pk_tail[]  = {"tail_up","tail_wag","tail_curl","tail_loop","tail_question"};
+                                    static const char* pk_head[]  = {"head_tilt","head_left","head_right","head_nod","head_loop","head_curious"};
+                                    neck_exec_.Run(pick(pk_neck, 6), 0, 1);
+                                    tail_exec_.Run(pick(pk_tail, 5), 0, 1);
+                                    head_exec_.Run(pick(pk_head, 6), 0, 1);
+                                    pickSound(kCuriousSounds2, kC2N);
+                                    break;
+                                }
+                                case MOTION_SHAKEN: {
+                                    static const char* sk_neck[] = {"neck_shake","neck_wave","neck_fast_shake","neck_circle","neck_snap_l","neck_snap_r"};
+                                    static const char* sk_tail[]  = {"tail_wag_fast","tail_tremble","tail_loop","tail_curl","tail_quiver"};
+                                    static const char* sk_head[]  = {"head_shake","head_loop","head_tilt","head_nod","head_alert"};
+                                    neck_exec_.Run(pick(sk_neck, 6), 0, 1);
+                                    tail_exec_.Run(pick(sk_tail, 5), 0, 1);
+                                    head_exec_.Run(pick(sk_head, 5), 0, 1);
+                                    pickSound(kSurpriseSounds2, kS2N);
+                                    break;
+                                }
+                                case MOTION_FLIPPED: {
+                                    static const char* fp_neck[] = {"neck_wave","neck_circle","neck_shake","neck_nod","neck_figure8"};
+                                    static const char* fp_tail[]  = {"tail_curl","tail_loop","tail_tremble","tail_wag_fast","tail_spiral"};
+                                    static const char* fp_head[]  = {"head_loop","head_shake","head_tilt","head_nod","head_stretch"};
+                                    neck_exec_.Run(pick(fp_neck, 5), 0, 1);
+                                    tail_exec_.Run(pick(fp_tail, 5), 0, 1);
+                                    head_exec_.Run(pick(fp_head, 5), 0, 1);
+                                    pickSound(kSurpriseSounds2, kS2N);
+                                    break;
+                                }
+                                case MOTION_PETTING: {
+                                    static const char* pt_neck[] = {"neck_nod","neck_wave","neck_left","neck_right","neck_sway"};
+                                    static const char* pt_tail[]  = {"tail_wag","tail_up","tail_curl","tail_sway","tail_scurve"};
+                                    static const char* pt_head[]  = {"head_calm","head_sway","head_tilt","head_micro_l","head_micro_r"};
+                                    neck_exec_.Run(pick(pt_neck, 5), 0, 2);
+                                    tail_exec_.Run(pick(pt_tail, 5), 0, 2);
+                                    head_exec_.Run(pick(pt_head, 5), 0, 1);
+                                    pickSound(kPurrSounds, kPN);
+                                    break;
+                                }
+                                case MOTION_DROPPED: {
+                                    static const char* dp_neck[] = {"neck_nod_slow","neck_bow","neck_lean_fwd"};
+                                    static const char* dp_tail[]  = {"tail_droop","tail_curl","tail_wag_slow","tail_rest"};
+                                    static const char* dp_head[]  = {"head_tilt_l","head_left","head_calm"};
+                                    neck_exec_.Run(pick(dp_neck, 3), 0, 1);
+                                    tail_exec_.Run(pick(dp_tail, 4), 0, 1);
+                                    head_exec_.Run(pick(dp_head, 3), 0, 1);
+                                    pickSound(kSadSounds, kSN);
+                                    break;
+                                }
                                 default: break;
                             }
                         }
@@ -226,7 +640,10 @@ private:
                 while (true) {
                     // ADC read IO6, 1V threshold
                     int adc_raw = 0;
-                    adc_oneshot_read(board->adc_handle_, ADC_CHANNEL_5, &adc_raw);
+                    if (xSemaphoreTake(board->adc_mutex_, pdMS_TO_TICKS(100)) == pdTRUE) {
+                        adc_oneshot_read(board->adc_handle_, ADC_CHANNEL_5, &adc_raw);
+                        xSemaphoreGive(board->adc_mutex_);
+                    }
                     int adc_mv = board->AdcToMv(adc_raw);
                     bool pressed = (adc_mv < 1000);  // active-low: pressed when voltage < 1V
                     tick++;
@@ -236,7 +653,10 @@ private:
                         ESP_LOGI(TAG, "POWER_OUT (IO6) adc=%dmV pressed=%d", adc_mv, pressed);
 
                         int bat_raw = 0;
-                        adc_oneshot_read(board->adc_handle_, BATTERY_ADC_CHANNEL, &bat_raw);
+                        if (xSemaphoreTake(board->adc_mutex_, pdMS_TO_TICKS(100)) == pdTRUE) {
+                            adc_oneshot_read(board->adc_handle_, BATTERY_ADC_CHANNEL, &bat_raw);
+                            xSemaphoreGive(board->adc_mutex_);
+                        }
                         int vpin_mv = board->AdcToMv(bat_raw);
                         int vbat_mv = static_cast<int>(vpin_mv * BATTERY_DIVIDER_RATIO);
                         if (board->battery_vbat_filtered_mv_ == 0) {
@@ -333,6 +753,7 @@ private:
             ESP_LOGW(TAG, "ADC init failed, battery/power monitor disabled");
             return;
         }
+        adc_mutex_ = xSemaphoreCreateMutex();
 
         adc_oneshot_chan_cfg_t chan_cfg = {
             .atten = ADC_ATTEN_DB_12,
@@ -346,6 +767,15 @@ private:
         adc_oneshot_config_channel(adc_handle_, ADC_CHANNEL_5, &chan_cfg);
 
         // IO5 touch button ADC channel (IO5 → ADC1_CH4, 4-bit R-2R DAC)
+        // Disable internal pulls to avoid interfering with R-2R DAC voltage levels
+        gpio_config_t io5_cfg = {
+            .pin_bit_mask = 1ULL << GPIO_NUM_5,
+            .mode = GPIO_MODE_INPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&io5_cfg);
         adc_oneshot_config_channel(adc_handle_, ADC_CHANNEL_4, &chan_cfg);
 
         // ADC calibration via curve fitting (eFuse VREF)
@@ -374,6 +804,8 @@ private:
 
     static void SetServoAngle(int servo_index, int angle) {
         angle = std::clamp(angle, 0, 180);
+        if (kServoInvert[servo_index])
+            angle = 180 - angle;
         uint32_t duty = AngleToDuty(angle);
         ledc_set_duty(LEDC_LOW_SPEED_MODE, kServoChannels[servo_index], duty);
         ledc_update_duty(LEDC_LOW_SPEED_MODE, kServoChannels[servo_index]);
@@ -444,6 +876,13 @@ private:
         return nullptr;  // GROUP_ALL handled separately (broadcast)
     }
 
+    // Run a single ALL-group action on all 3 executors
+    void RunAllAction(const char* name, uint16_t speed, uint8_t cycles) {
+        neck_exec_.Run(name, speed, cycles);
+        tail_exec_.Run(name, speed, cycles);
+        head_exec_.Run(name, speed, cycles);
+    }
+
     void RunOnAllGroups(const char* name, uint16_t speed, uint8_t cycles, bool loop) {
         // For combined (all_*) actions: submit to all 3 executors simultaneously
         neck_exec_.Run(name, speed, cycles, loop);
@@ -457,12 +896,28 @@ private:
         // === Action tools ===
 
         mcp.AddTool("self.action.run",
-                    "Run action by name or id. Each group independent — can overlap! "
-                    "Neck(1001-6): left right nod shake wave loop. "
-                    "Tail(2001-7): wag wag_fast up down tremble curl loop. "
-                    "Head(3001-6): left right nod shake tilt loop. "
-                    "All(4001-7): reset happy greeting sleep wake dance curious. "
-                    "speed: ms/step (0=100). cycles: 次. loop: true=循环.",
+                    "Run ONE action by name or id. Call multiple times to combine groups! "
+                    "speed: ms/step (0=100=1s/action). cycles: repeat count. loop: true=continuous.\n"
+                    "Neck(1001-1023) 脖子: left/right(左右弯) forward(前倾) backward(后仰) nod(点头) "
+                    "shake(左右摇) tilt_left/right(左/右歪头) nod_slow(慢点头) wave(波浪) "
+                    "stretch(伸懒腰) relax(放松) sway(摇摆) snap_l/r(快速左/右甩) "
+                    "lean_fwd(前倾深) bow(深鞠躬) fast_shake(快摇) curious(好奇歪头) "
+                    "circle(画圈) glance_lu/rd(左上/右下瞥) figure8(8字).\n"
+                    "Tail(2001-2024) 尾巴: wag(摇尾) wag_fast(快摇) wag_slow(慢摇) "
+                    "up(上翘) down(下垂) left/right(左/右弯) tremble(颤抖) curl(卷曲) "
+                    "loop(循环) swish(优雅甩) flick(轻弹) perk(开心翘) sweep(横扫) "
+                    "question(问号) sway(摇摆) bounce(弹跳) droop(垂) hook(钩) "
+                    "spiral(盘旋) scurve(S弯) rest(回中) quiver(微颤).\n"
+                    "Head(3001-3025) 头: left/right(左/右转) nod(点头) shake(摇头) "
+                    "tilt_l/r(左/右歪) tilt(交替歪) glance_l/r(快速瞥) dbl_take(双次确认) "
+                    "curious(好奇) loop(循环) sway(摇摆) alert(警觉) bob(轻点) "
+                    "confused(困惑) sweep(慢扫) sweep_fast(快扫) calm(平静) relax(放松) "
+                    "scan_l/r(慢扫视) micro_l/r(微调) stretch(极限拉伸).\n"
+                    "All(4001-4020) 组合: reset(回中) happy(开心) greeting(问候) sleep(睡) "
+                    "wake(醒) dance(跳舞) curious(好奇) stretch(伸懒腰) bow(鞠躬) "
+                    "snuggle(依偎) scared(害怕) angry(生气) playful(玩耍) love(爱) "
+                    "peek(偷看) slow_blink(慢眨眼) head_tilt(歪头杀) pounce(前扑) "
+                    "shake_off(抖身体) alert(警觉).",
                     PropertyList({Property("name", kPropertyTypeString, ""),
                                   Property("id", kPropertyTypeInteger, 0),
                                   Property("speed", kPropertyTypeInteger, 0),
@@ -481,6 +936,54 @@ private:
                         char buf[64];
                         snprintf(buf, sizeof(buf), "%s: %s", ok ? "OK" : "FAIL",
                                  id > 0 ? std::to_string(id).c_str() : name.c_str());
+                        return std::string(buf);
+                    });
+
+        mcp.AddTool("self.action.combo",
+                    "Run neck+tail+head actions TOGETHER! Smart combo for natural commands.\n"
+                    "Examples: 向左看→neck=neck_left+head=head_left "
+                    "开心→neck=neck_nod+tail=tail_wag "
+                    "生气→neck=neck_fast_shake+tail=tail_wag_fast+head=head_shake "
+                    "撒娇→neck=neck_tilt_left+tail=tail_perk+head=head_tilt_left "
+                    "好奇→neck=neck_curious+tail=tail_question+head=head_curious "
+                    "跳舞→neck=neck_wave+tail=tail_spiral+head=head_sway "
+                    "鞠躬→neck=neck_bow+tail=tail_sweep "
+                    "舒服→neck=neck_nod_slow+tail=tail_sway "
+                    "警觉→neck=neck_stretch+head=head_alert "
+                    "放松→neck=neck_relax+tail=tail_rest+head=head_calm "
+                    "被摸→neck=neck_nod_slow+tail=tail_sway 等等任意组合!"
+                    "Leave a group empty to skip.",
+                    PropertyList({Property("neck", kPropertyTypeString, ""),
+                                  Property("tail", kPropertyTypeString, ""),
+                                  Property("head", kPropertyTypeString, ""),
+                                  Property("speed", kPropertyTypeInteger, 0),
+                                  Property("cycles", kPropertyTypeInteger, 0),
+                                  Property("loop", kPropertyTypeBoolean, false)}),
+                    [this](const PropertyList& props) -> ReturnValue {
+                        const auto& neck = props["neck"].value<std::string>();
+                        const auto& tail = props["tail"].value<std::string>();
+                        const auto& head = props["head"].value<std::string>();
+                        uint16_t speed = props["speed"].value<int>();
+                        uint8_t cycles = props["cycles"].value<int>();
+                        bool loop = props["loop"].value<bool>();
+                        int count = 0;
+
+                        if (!neck.empty()) {
+                            neck_exec_.Run(neck.c_str(), speed, cycles, loop);
+                            count++;
+                        }
+                        if (!tail.empty()) {
+                            tail_exec_.Run(tail.c_str(), speed, cycles, loop);
+                            count++;
+                        }
+                        if (!head.empty()) {
+                            head_exec_.Run(head.c_str(), speed, cycles, loop);
+                            count++;
+                        }
+
+                        if (count == 0) return std::string("FAIL: no group specified");
+                        char buf[32];
+                        snprintf(buf, sizeof(buf), "OK: %d groups", count);
                         return std::string(buf);
                     });
 
@@ -530,14 +1033,32 @@ private:
                         auto state = Application::GetInstance().GetDeviceState();
                         if (state == kDeviceStateListening || state == kDeviceStateSpeaking) {
                             if ((rand() % 10) == 0) {  // 10% chance every ~4s
-                                // Randomly pick a group and trigger its emote
-                                int g = rand() % 3;
+                                int g = rand() % 6;  // 0-2=single, 3-4=dual, 5=triple
                                 if (g == 0)
                                     board->neck_exec_.PlayRandomEmote();
                                 else if (g == 1)
                                     board->tail_exec_.PlayRandomEmote();
-                                else
+                                else if (g == 2)
                                     board->head_exec_.PlayRandomEmote();
+                                else if (g <= 4) {
+                                    // Dual combo
+                                    board->neck_exec_.PlayRandomEmote();
+                                    board->tail_exec_.PlayRandomEmote();
+                                } else {
+                                    // Triple combo
+                                    board->neck_exec_.PlayRandomEmote();
+                                    board->tail_exec_.PlayRandomEmote();
+                                    board->head_exec_.PlayRandomEmote();
+                                }
+                                // Occasionally play a tiny meow during chat (30% chance)
+                                if ((rand() % 100) < 30) {
+                                    static const std::string_view kEmoteSounds[] = {
+                                        Lang::Sounds::OGG_EMOTION_HAPPY_1, Lang::Sounds::OGG_EMOTION_HAPPY_2,
+                                        Lang::Sounds::OGG_EMOTION_HAPPY_3, Lang::Sounds::OGG_EMOTION_NEUTRAL_1,
+                                        Lang::Sounds::OGG_EMOTION_NEUTRAL_2, Lang::Sounds::OGG_EMOTION_NEUTRAL_3,
+                                    };
+                                    Application::GetInstance().PlaySound(kEmoteSounds[rand() % 6]);
+                                }
                             }
                         }
                         vTaskDelay(pdMS_TO_TICKS(4000 + (rand() % 4000)));
@@ -581,9 +1102,26 @@ public:
         InitializePowerSaveTimer();
         InitializeTools();
 
+        // Cat sound playback queue + task (non-blocking for touch task)
+        cat_sound_queue_ = xQueueCreate(3, sizeof(cat_sound_type_t));
+        xTaskCreate([](void* arg) { static_cast<CatTailAndNeckBoard*>(arg)->CatSoundTask(); },
+                    "cat_sound", 4096, this, 3, nullptr);
+
         // Start touch + motion detection task
         xTaskCreate([](void* arg) { static_cast<CatTailAndNeckBoard*>(arg)->TouchMotionTask(); },
                     "touch_motion", 4096, this, 2, &touch_task_);
+
+        // Boot sound: cute short meow via OGG
+        xTaskCreate([](void* arg) {
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            auto state = Application::GetInstance().GetDeviceState();
+            if (state == kDeviceStateStarting || state == kDeviceStateIdle ||
+                state == kDeviceStateConnecting) {
+                Application::GetInstance().PlaySound(Lang::Sounds::OGG_ANIME_MEW1);
+                ESP_LOGI(TAG, "🐱 开机喵~");
+            }
+            vTaskDelete(nullptr);
+        }, "boot_sound", 2048, nullptr, 1, nullptr);
     }
 
     // ===== Action API (call from anywhere) =====

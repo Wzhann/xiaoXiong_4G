@@ -1,6 +1,7 @@
 #ifndef _CAT_ACTION_EXECUTOR_H_
 #define _CAT_ACTION_EXECUTOR_H_
 
+#include <esp_log.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/task.h>
@@ -37,7 +38,7 @@ public:
 
     void Start(ServoSetFunc set_servo) {
         set_servo_ = set_servo;
-        queue_ = xQueueCreate(4, sizeof(ActionRequest));
+        queue_ = xQueueCreate(8, sizeof(ActionRequest));
         stop_requested_ = false;
         char name[16];
         snprintf(name, sizeof(name), "act_%s", tag_);
@@ -46,13 +47,19 @@ public:
 
     bool Run(const char* name, uint16_t speed = 0, uint8_t cycles = 0, bool loop = false) {
         const ServoAction* action = FindAction(name);
-        if (!action) return false;
+        if (!action) {
+            ESP_LOGW("ActionExec", "%s: action '%s' NOT FOUND (kActionCount=%d)", tag_, name, kActionCount);
+            return false;
+        }
         return Enqueue(action, speed, cycles, loop);
     }
 
     bool RunById(uint16_t id, uint16_t speed = 0, uint8_t cycles = 0, bool loop = false) {
         const ServoAction* action = FindActionById(id);
-        if (!action) return false;
+        if (!action) {
+            ESP_LOGW("ActionExec", "%s: action id=%d NOT FOUND", tag_, id);
+            return false;
+        }
         return Enqueue(action, speed, cycles, loop);
     }
 
@@ -62,7 +69,14 @@ public:
         while (xQueueReceive(queue_, &dummy, 0) == pdTRUE) {}
     }
 
+    // Clear queued actions without interrupting the currently running one
+    void ClearPending() {
+        ActionRequest dummy;
+        while (xQueueReceive(queue_, &dummy, 0) == pdTRUE) {}
+    }
+
     bool IsRunning() const { return running_; }
+    bool IsBusy() const { return running_ || uxQueueMessagesWaiting(queue_) > 0; }
 
     const ServoAction* FindAction(const char* name) {
         for (int i = 0; i < kActionCount; i++)
@@ -77,14 +91,23 @@ public:
     }
 
     void PlayRandomEmote() {
-        static const char* neck_list[] = {"neck_nod","neck_shake","neck_wave","neck_left","neck_right"};
-        static const char* tail_list[] = {"tail_wag","tail_wag_fast","tail_tremble","tail_up","tail_curl"};
-        static const char* head_list[] = {"head_nod","head_shake","head_tilt","head_left","head_right","head_loop"};
+        static const char* neck_list[] = {"neck_nod","neck_shake","neck_wave","neck_left",
+                                          "neck_right","neck_circle","neck_curious","neck_sway",
+                                          "neck_tilt_left","neck_tilt_right","neck_nod_slow",
+                                          "neck_glance_lu","neck_figure8"};
+        static const char* tail_list[] = {"tail_wag","tail_wag_fast","tail_tremble","tail_up",
+                                          "tail_curl","tail_loop","tail_sway","tail_swish",
+                                          "tail_bounce","tail_scurve","tail_perk","tail_wag_slow",
+                                          "tail_question","tail_spiral"};
+        static const char* head_list[] = {"head_nod","head_shake","head_tilt","head_left",
+                                          "head_right","head_loop","head_sway","head_curious",
+                                          "head_glance_l","head_glance_r","head_dbl_take",
+                                          "head_bob","head_scan_l","head_scan_r","head_tilt_l","head_tilt_r"};
         const char** list = nullptr;
         int cnt = 0;
-        if (group_mask_ == GROUP_NECK) { list = neck_list; cnt = 5; }
-        else if (group_mask_ == GROUP_TAIL) { list = tail_list; cnt = 5; }
-        else if (group_mask_ == GROUP_HEAD) { list = head_list; cnt = 6; }
+        if (group_mask_ == GROUP_NECK) { list = neck_list; cnt = sizeof(neck_list)/sizeof(neck_list[0]); }
+        else if (group_mask_ == GROUP_TAIL) { list = tail_list; cnt = sizeof(tail_list)/sizeof(tail_list[0]); }
+        else if (group_mask_ == GROUP_HEAD) { list = head_list; cnt = sizeof(head_list)/sizeof(head_list[0]); }
         if (list) Run(list[rand() % cnt], 0, 0);
     }
 
@@ -105,7 +128,11 @@ private:
         req.speed = speed;
         req.cycles = cycles;
         req.loop = loop;
-        xQueueSend(queue_, &req, 0);
+        if (xQueueSend(queue_, &req, 0) != pdTRUE) {
+            ESP_LOGW("ActionExec", "%s: queue full, dropped '%s'", tag_, action->name);
+            return false;
+        }
+        ESP_LOGI("ActionExec", "%s: queued '%s' speed=%d cyc=%d", tag_, action->name, speed, cycles);
         return true;
     }
 
@@ -131,6 +158,7 @@ private:
         bool loop = req.loop;
         uint16_t step_ms = req.speed > 0 ? req.speed : STEP_MS;
         uint8_t aps = (group_mask_ == GROUP_ALL) ? 5 : servo_count_;
+        ESP_LOGI("ActionExec", "%s: exec '%s' steps=%d aps=%d", tag_, action.name, action.series[0].total_steps, aps);
 
         uint32_t n = 0;
         while ((loop || n < cycles) && !stop_requested_) {

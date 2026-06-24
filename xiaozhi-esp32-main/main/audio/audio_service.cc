@@ -694,6 +694,14 @@ void AudioService::PlaySound(const std::string_view& ogg) {
     const auto* buf = reinterpret_cast<const uint8_t*>(ogg.data());
     size_t size = ogg.size();
 
+    // Clear old sound to make room for the new one (non-blocking)
+    {
+        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+        audio_decode_queue_.clear();
+        audio_playback_queue_.clear();
+        audio_queue_cv_.notify_all();
+    }
+
     auto demuxer = std::make_unique<OggDemuxer>();
     demuxer->OnDemuxerFinished([this](const uint8_t* data, int sample_rate, size_t size){
         auto packet = std::make_unique<AudioStreamPacket>();
@@ -701,7 +709,7 @@ void AudioService::PlaySound(const std::string_view& ogg) {
         packet->frame_duration = 60;
         packet->payload.resize(size);
         std::memcpy(packet->payload.data(), data, size);
-        PushPacketToDecodeQueue(std::move(packet), true);
+        PushPacketToDecodeQueue(std::move(packet), false);  // non-blocking: drop if full
     });
     demuxer->Reset();
     demuxer->Process(buf, size);
