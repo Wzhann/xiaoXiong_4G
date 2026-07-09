@@ -39,14 +39,14 @@
 #define BATTERY_FULL_VOLTAGE_MV 4200
 
 // Servo PWM: 5 servos in 3 groups, power controlled by IO4
-// Group Neck: IO15, IO16
-// Group Tail: IO17, IO18
+// Group Neck: IO18, IO17
+// Group Tail: IO15, IO16
 // Group Head: IO8
 #define SERVO_POWER_GPIO GPIO_NUM_4
-#define SERVO_0_GPIO GPIO_NUM_15  // Neck
-#define SERVO_1_GPIO GPIO_NUM_16  // Neck
-#define SERVO_2_GPIO GPIO_NUM_17  // Tail
-#define SERVO_3_GPIO GPIO_NUM_18  // Tail
+#define SERVO_0_GPIO GPIO_NUM_18  // Neck0
+#define SERVO_1_GPIO GPIO_NUM_17  // Neck1
+#define SERVO_2_GPIO GPIO_NUM_15  // Tail0
+#define SERVO_3_GPIO GPIO_NUM_16  // Tail1
 #define SERVO_4_GPIO GPIO_NUM_8   // Head
 
 #endif  // _BOARD_CONFIG_H_

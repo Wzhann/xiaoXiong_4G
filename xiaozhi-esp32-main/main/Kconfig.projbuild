@@ -260,6 +260,9 @@ choice BOARD_TYPE
     config BOARD_TYPE_TUZI_SD
         bool "tuzi_SD"
         depends on IDF_TARGET_ESP32S3
+    config BOARD_TYPE_BREATHE_HE
+        bool "breathe_he"
+        depends on IDF_TARGET_ESP32S3
     config BOARD_TYPE_M5STACK_ATOM_S3R_ECHO_BASE
         bool "M5Stack AtomS3R + Echo Base"
         depends on IDF_TARGET_ESP32S3

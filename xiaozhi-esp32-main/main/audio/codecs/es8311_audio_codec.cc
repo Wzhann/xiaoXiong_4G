@@ -63,8 +63,32 @@ Es8311AudioCodec::Es8311AudioCodec(void* i2c_master_handle, i2c_port_t i2c_port,
 
     if (codec_if_ == nullptr) {
         ESP_LOGE(TAG, "Failed to create Es8311AudioCodec");
-    } else {
-        ESP_LOGI(TAG, "Es8311AudioCodec initialized");
+        return;
+    }
+    ESP_LOGI(TAG, "Es8311AudioCodec initialized");
+
+    // Pre-open the codec device so the first PlaySound is instantaneous.
+    // Without this, esp_codec_dev_open() is called lazily on first EnableOutput(),
+    // which involves slow I2C register writes (PLL lock, DAC/ADC power-up, unmute)
+    // causing a noticeable delay before the WiFi config voice prompt.
+    esp_codec_dev_cfg_t dev_cfg = {
+        .dev_type = ESP_CODEC_DEV_TYPE_IN_OUT,
+        .codec_if = codec_if_,
+        .data_if = data_if_,
+    };
+    dev_ = esp_codec_dev_new(&dev_cfg);
+    if (dev_ != nullptr) {
+        esp_codec_dev_sample_info_t fs = {
+            .bits_per_sample = 16,
+            .channel = 1,
+            .channel_mask = 0,
+            .sample_rate = (uint32_t)input_sample_rate_,
+            .mclk_multiple = 0,
+        };
+        esp_codec_dev_open(dev_, &fs);
+        esp_codec_dev_set_in_gain(dev_, input_gain_);
+        esp_codec_dev_set_out_vol(dev_, output_volume_);
+        ESP_LOGI(TAG, "ES8311 hardware pre-initialized, vol=%d gain=%.0f", output_volume_, (double)input_gain_);
     }
 }
 
@@ -78,7 +102,10 @@ Es8311AudioCodec::~Es8311AudioCodec() {
 }
 
 void Es8311AudioCodec::UpdateDeviceState() {
+    // dev_ is pre-opened in the constructor — never close it, so the hardware
+    // stays warm and the first PlaySound (e.g. WiFi config voice) is instant.
     if ((input_enabled_ || output_enabled_) && dev_ == nullptr) {
+        // Fallback: should not happen since constructor pre-opens dev_
         esp_codec_dev_cfg_t dev_cfg = {
             .dev_type = ESP_CODEC_DEV_TYPE_IN_OUT,
             .codec_if = codec_if_,
@@ -95,11 +122,12 @@ void Es8311AudioCodec::UpdateDeviceState() {
             .mclk_multiple = 0,
         };
         ESP_ERROR_CHECK(esp_codec_dev_open(dev_, &fs));
+    }
+    // Always apply current gain/volume when enabling (dev_ may have been
+    // pre-opened in the constructor, so these wouldn't run in the branch above).
+    if (input_enabled_ || output_enabled_) {
         ESP_ERROR_CHECK(esp_codec_dev_set_in_gain(dev_, input_gain_));
         ESP_ERROR_CHECK(esp_codec_dev_set_out_vol(dev_, output_volume_));
-    } else if (!input_enabled_ && !output_enabled_ && dev_ != nullptr) {
-        esp_codec_dev_close(dev_);
-        dev_ = nullptr;
     }
     if (pa_pin_ != GPIO_NUM_NC) {
         int level = output_enabled_ ? 1 : 0;

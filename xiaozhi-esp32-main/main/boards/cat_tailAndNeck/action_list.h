@@ -4,13 +4,13 @@
 #include <cstdint>
 
 // Action system — AI toy cat, 91 actions v3
-// Servo order: Neck0=side_bend, Neck1=fwd_back,
-//               Tail0=up_down, Tail1=side_bend, Head=left_right
-// Neck0 (IO18): 0=左弯, 90=center, 180=右弯 (inv)
-// Neck1 (IO17): 0=前倾, 90=center, 180=后仰 (inv)
-// Tail0 (IO15): 0=上翘, 90=center, ~160=平放
-// Tail1 (IO16): 0=左弯, 90=center, 180=右弯
-// Head  (IO8):  0=左转, 90=center, 180=右转 (inv)
+// Servo order: Neck0=左右弯, Neck1=前后倾,
+//               Tail0=上翘/平放, Tail1=左右弯, Head=左右转
+// Neck0 (IO18): 0=左弯, 90=center, 180=右弯 (no invert)
+// Neck1 (IO17): 0=前倾, 90=center, 180=后仰 (no invert)
+// Tail0 (IO15): 0=上翘, 90=center, ~160=平放 (no invert)
+// Tail1 (IO16): 0=左弯, 90=center, 180=右弯 (INVERT — cat_actionRecord)
+// Head  (IO8):  0=左转, 90=center, 180=右转 (INVERT)
 
 #define STEP_MS 100
 #define GROUP_NECK  0x03
