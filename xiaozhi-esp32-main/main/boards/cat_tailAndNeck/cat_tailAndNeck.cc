@@ -6,6 +6,7 @@
 #include "cat_audio.h"
 #include "codecs/es8311_audio_codec.h"
 #include "config.h"
+#include "demo_actions.h"
 #include "led/single_led.h"
 #include "mcp_server.h"
 #include "mpu6050.h"
@@ -13,6 +14,8 @@
 #include "wifi_board.h"
 #include "wifi_configuration_ap.h"
 #include "wifi_manager.h"
+#include <esp_http_server.h>
+#include <esp_wifi.h>
 
 #include <driver/gpio.h>
 #include <driver/i2c_master.h>
@@ -57,6 +60,254 @@ static uint32_t AngleToDuty(int angle) {
     return pulse_us * (SERVO_MAX_DUTY + 1) / SERVO_PERIOD_US;
 }
 
+static const char kDemoHtml[] = R"raw(<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>Cat Control</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,sans-serif;background:#0d1117;color:#c9d1d9;padding:8px;max-width:440px;margin:auto}
+h1{text-align:center;font-size:16px;color:#58a6ff;margin:4px 0 8px}
+.card{background:#161b22;border-radius:8px;padding:8px;margin-bottom:6px;border:1px solid #30363d}
+h2{font-size:13px;margin-bottom:4px;color:#58a6ff}
+.btn{display:inline-block;padding:8px 12px;border:none;border-radius:5px;font-size:13px;cursor:pointer;color:#fff;margin:2px;min-width:56px}
+.btn:active{opacity:.7}
+.btn-demo{background:#238636}
+.btn-stop{background:#da3633}
+.btn-preset{background:#30363d;font-size:11px;padding:6px 10px}
+.row{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.val{font-weight:bold;color:#58a6ff;font-size:15px}
+.lbl{font-size:10px;color:#8b949e}
+.stat-row{display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid #21262d;font-size:12px}
+.bar-bg{background:#21262d;border-radius:4px;height:16px;flex:1;overflow:hidden;margin:0 6px}
+.bar-fill{background:linear-gradient(90deg,#238636,#2ea043);height:100%;border-radius:4px;transition:width .5s}
+.toggle-sw{position:relative;display:inline-block;width:48px;height:26px}
+.toggle-sw input{opacity:0;width:0;height:0}
+.toggle-sl{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:#30363d;border-radius:26px;transition:.3s}
+.toggle-sl:before{position:absolute;content:"";height:20px;width:20px;left:3px;bottom:3px;background:#8b949e;border-radius:50%;transition:.3s}
+input:checked+.toggle-sl{background:#238636}
+input:checked+.toggle-sl:before{transform:translateX(22px);background:#fff}
+.status-dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:3px;background:#30363d}
+.status-dot.on{background:#2ea043;animation:pulse 1.5s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.joy-row{display:flex;gap:10px;justify-content:center;align-items:center}
+canvas{border-radius:50%;background:#0a0f1e;touch-action:none;display:block}
+canvas.joy-neck{border:2px solid #4ecca3;box-shadow:0 0 10px rgba(78,204,163,.2)}
+canvas.joy-tail{border:2px solid #4ea3cc;box-shadow:0 0 10px rgba(78,163,204,.2)}
+.joy-info{text-align:center;min-width:70px}
+.joy-info .jval{font-size:20px;font-weight:bold}
+.joy-info .jlbl{font-size:10px;color:#8b949e}
+.head-row{display:flex;align-items:center;gap:8px;justify-content:center}
+.head-row input[type=range]{flex:1;max-width:260px}
+.head-row .jval{font-size:18px;font-weight:bold;color:#a34ecc;min-width:40px;text-align:center}
+#log{background:#0d1117;color:#8b949e;font-size:10px;padding:4px;border-radius:4px;max-height:80px;overflow-y:auto;font-family:monospace;line-height:1.4}
+</style>
+</head><body>
+<h1>Cat Control</h1>
+
+<div class="card">
+<h2>Mode</h2>
+<div class="row">
+<label class="toggle-sw"><input type="checkbox" id="modeToggle" onchange="setMode(this.checked)"><span class="toggle-sl"></span></label>
+<span style="font-size:13px;margin-left:8px" id="modeLabel">Touch/IMU Auto</span>
+</div>
+</div>
+
+<div class="card" id="joyCard">
+<h2>Joystick (Neck + Tail + Head)</h2>
+<div class="joy-row">
+<div>
+<canvas class="joy-neck" id="joyN" width="150" height="150"></canvas>
+<div class="joy-info"><span class="jlbl">Neck</span><br><span class="jval" style="color:#4ecca3" id="jN0">90</span>° <span class="jval" style="color:#4ecca3" id="jN1">90</span>°</div>
+</div>
+<div>
+<canvas class="joy-tail" id="joyT" width="150" height="150"></canvas>
+<div class="joy-info"><span class="jlbl">Tail</span><br><span class="jval" style="color:#4ea3cc" id="jT0">90</span>° <span class="jval" style="color:#4ea3cc" id="jT1">90</span>°</div>
+</div>
+</div>
+<div class="head-row" style="margin-top:6px">
+<span class="jlbl">Head</span>
+<input type="range" id="sHead" min="0" max="180" value="90" oninput="onHead(this.value)">
+<span class="jval" style="color:#a34ecc" id="jHead">90</span>°
+</div>
+<div class="row" style="margin-top:4px;justify-content:center">
+<button class="btn btn-preset" onclick="preset(90,90,90,90,90)">Home</button>
+<button class="btn btn-preset" onclick="preset(60,120,120,60,90)">左看</button>
+<button class="btn btn-preset" onclick="preset(120,60,60,120,90)">右看</button>
+<button class="btn btn-preset" onclick="preset(90,110,40,90,90)">上翘</button>
+<button class="btn btn-preset" onclick="preset(90,70,140,90,90)">下垂</button>
+</div>
+</div>
+
+<div class="card">
+<h2>Demo Actions</h2>
+<div class="row">
+<button class="btn btn-demo" onclick="runDemo(0)">orig</button>
+<button class="btn btn-demo" onclick="runDemo(1)">A3</button>
+<button class="btn btn-demo" onclick="runDemo(2)">A6</button>
+<button class="btn btn-demo" onclick="runDemo(3)">A7</button>
+<button class="btn btn-demo" onclick="runDemo(4)">A9</button>
+<button class="btn btn-stop" onclick="stopAll()">Stop</button>
+</div>
+</div>
+
+<div class="card">
+<h2>Status</h2>
+<div id="statusPane">Loading...</div>
+</div>
+
+<script>
+let lastSend=0,angles=[90,90,90,90,90],pollTimer;
+const $=id=>document.getElementById(id);
+
+async function api(url,body){
+  try{
+    let o=body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{method:'GET'};
+    let r=await fetch(url,o);
+    return await r.json();
+  }catch(e){return null}
+}
+
+function sendAngles(){
+  let now=Date.now();
+  if(now-lastSend<50)return;
+  lastSend=now;
+  api('/api/servo',{angles:angles});
+}
+
+// Joystick: Neck
+new function(){
+  let c=$('joyN'),ctx=c.getContext('2d'),cx=75,cy=75,R=65,kr=18,kx=75,ky=75,active=false;
+  function draw(){
+    ctx.clearRect(0,0,150,150);
+    ctx.beginPath();ctx.arc(cx,cy,R,0,6.28);ctx.strokeStyle='rgba(255,255,255,.15)';ctx.lineWidth=2;ctx.stroke();
+    ctx.beginPath();ctx.moveTo(cx-R,cy);ctx.lineTo(cx+R,cy);ctx.moveTo(cx,cy-R);ctx.lineTo(cx,cy+R);
+    ctx.strokeStyle='rgba(255,255,255,.06)';ctx.lineWidth=1;ctx.stroke();
+    ctx.beginPath();ctx.arc(kx,ky,kr,0,6.28);
+    let g=ctx.createRadialGradient(kx-4,ky-4,2,kx,ky,kr);
+    g.addColorStop(0,'#5eeaaf');g.addColorStop(1,'#2d8a5e');
+    ctx.fillStyle=g;ctx.fill();ctx.strokeStyle='rgba(255,255,255,.3)';ctx.lineWidth=2;ctx.stroke();
+  }
+  function move(e){
+    e.preventDefault();
+    let r=c.getBoundingClientRect(),mx=(e.clientX-r.left)*150/r.width,my=(e.clientY-r.top)*150/r.height;
+    let dx=mx-cx,dy=my-cy,dist=Math.sqrt(dx*dx+dy*dy);
+    if(dist>R){dx*=R/dist;dy*=R/dist;}
+    kx=cx+dx;ky=cy+dy;
+    angles[0]=Math.round(90+(kx-cx)/R*90);angles[1]=Math.round(90+(ky-cy)/R*90);
+    angles[0]=Math.max(0,Math.min(180,angles[0]));angles[1]=Math.max(0,Math.min(180,angles[1]));
+    $('jN0').textContent=angles[0];$('jN1').textContent=angles[1];
+    sendAngles();draw();
+  }
+  function up(){
+    if(!active)return;
+    active=false;
+    let t0=performance.now(),sx=kx,sy=ky,dx=cx-sx,dy=cy-sy;
+    function anim(ts){
+      let t=Math.min(1,(ts-t0)/200),ease=t<.5?4*t*t*t:1-Math.pow(-2*t+2,3)/2;
+      kx=sx+dx*ease;ky=sy+dy*ease;
+      angles[0]=Math.round(90+(kx-cx)/R*90);angles[1]=Math.round(90+(ky-cy)/R*90);
+      angles[0]=Math.max(0,Math.min(180,angles[0]));angles[1]=Math.max(0,Math.min(180,angles[1]));
+      $('jN0').textContent=angles[0];$('jN1').textContent=angles[1];
+      sendAngles();draw();
+      if(t<1)requestAnimationFrame(anim);else{kx=cx;ky=cy;draw();setTimeout(()=>{angles[0]=90;angles[1]=90;sendAngles();$('jN0').textContent='90';$('jN1').textContent='90'},100)}
+    }
+    requestAnimationFrame(anim);
+  }
+  c.addEventListener('pointerdown',e=>{active=true;move(e)});
+  c.addEventListener('pointermove',e=>{if(active)move(e)});
+  c.addEventListener('pointerup',up);
+  c.addEventListener('pointerleave',up);
+  draw();
+}
+
+// Joystick: Tail
+new function(){
+  let c=$('joyT'),ctx=c.getContext('2d'),cx=75,cy=75,R=65,kr=18,kx=75,ky=75,active=false;
+  function draw(){
+    ctx.clearRect(0,0,150,150);
+    ctx.beginPath();ctx.arc(cx,cy,R,0,6.28);ctx.strokeStyle='rgba(255,255,255,.15)';ctx.lineWidth=2;ctx.stroke();
+    ctx.beginPath();ctx.moveTo(cx-R,cy);ctx.lineTo(cx+R,cy);ctx.moveTo(cx,cy-R);ctx.lineTo(cx,cy+R);
+    ctx.strokeStyle='rgba(255,255,255,.06)';ctx.lineWidth=1;ctx.stroke();
+    ctx.beginPath();ctx.arc(kx,ky,kr,0,6.28);
+    let g=ctx.createRadialGradient(kx-4,ky-4,2,kx,ky,kr);
+    g.addColorStop(0,'#5eb8ea');g.addColorStop(1,'#2d6a8e');
+    ctx.fillStyle=g;ctx.fill();ctx.strokeStyle='rgba(255,255,255,.3)';ctx.lineWidth=2;ctx.stroke();
+  }
+  function move(e){
+    e.preventDefault();
+    let r=c.getBoundingClientRect(),mx=(e.clientX-r.left)*150/r.width,my=(e.clientY-r.top)*150/r.height;
+    let dx=mx-cx,dy=my-cy,dist=Math.sqrt(dx*dx+dy*dy);
+    if(dist>R){dx*=R/dist;dy*=R/dist;}
+    kx=cx+dx;ky=cy+dy;
+    angles[2]=Math.round(90+(kx-cx)/R*90);angles[3]=Math.round(90+(ky-cy)/R*90);
+    angles[2]=Math.max(0,Math.min(180,angles[2]));angles[3]=Math.max(0,Math.min(180,angles[3]));
+    $('jT0').textContent=angles[2];$('jT1').textContent=angles[3];
+    sendAngles();draw();
+  }
+  function up(){
+    if(!active)return;
+    active=false;
+    let t0=performance.now(),sx=kx,sy=ky,dx=cx-sx,dy=cy-sy;
+    function anim(ts){
+      let t=Math.min(1,(ts-t0)/200),ease=t<.5?4*t*t*t:1-Math.pow(-2*t+2,3)/2;
+      kx=sx+dx*ease;ky=sy+dy*ease;
+      angles[2]=Math.round(90+(kx-cx)/R*90);angles[3]=Math.round(90+(ky-cy)/R*90);
+      angles[2]=Math.max(0,Math.min(180,angles[2]));angles[3]=Math.max(0,Math.min(180,angles[3]));
+      $('jT0').textContent=angles[2];$('jT1').textContent=angles[3];
+      sendAngles();draw();
+      if(t<1)requestAnimationFrame(anim);else{kx=cx;ky=cy;draw();setTimeout(()=>{angles[2]=90;angles[3]=90;sendAngles();$('jT0').textContent='90';$('jT1').textContent='90'},100)}
+    }
+    requestAnimationFrame(anim);
+  }
+  c.addEventListener('pointerdown',e=>{active=true;move(e)});
+  c.addEventListener('pointermove',e=>{if(active)move(e)});
+  c.addEventListener('pointerup',up);
+  c.addEventListener('pointerleave',up);
+  draw();
+}
+
+function onHead(v){
+  angles[4]=parseInt(v);
+  $('jHead').textContent=angles[4];
+  sendAngles();
+}
+
+function preset(a0,a1,a2,a3,a4){
+  angles=[a0,a1,a2,a3,a4];
+  $('jN0').textContent=a0;$('jN1').textContent=a1;
+  $('jT0').textContent=a2;$('jT1').textContent=a3;
+  $('sHead').value=a4;$('jHead').textContent=a4;
+  sendAngles();
+}
+
+async function runDemo(i){await api('/api/demo',{id:i})}
+async function stopAll(){await api('/api/stop')}
+async function setMode(on){
+  await api('/api/mode',{demo_mode:on});
+  $('modeLabel').textContent=on?'Phone Control':'Touch/IMU Auto';
+}
+
+async function pollStatus(){
+  let s=await api('/api/status');
+  if(!s){return}
+  let bc=s.bat_pct>30?'#2ea043':(s.bat_pct>15?'#d29922':'#da3633');
+  $('statusPane').innerHTML=
+    '<div class="stat-row"><span>Battery</span><span class="val" style="color:'+bc+'">'+s.bat_pct+'% '+s.bat_mv+'mV</span></div>'+
+    '<div class="stat-row"><span></span><div class="bar-bg"><div class="bar-fill" style="width:'+s.bat_pct+'%"></div></div></div>'+
+    '<div class="stat-row"><span>Touch</span><span class="val">0x'+(s.touch_code||0).toString(16).padStart(2,'0').toUpperCase()+' ('+s.touch_mv+'mV)</span></div>'+
+    '<div class="stat-row"><span>Gyro</span><span>'+s.gyro_ok+'</span></div>'+
+    '<div class="stat-row"><span>Orient</span><span class="val">'+s.orient+'</span></div>'+
+    '<div class="stat-row"><span>Action</span><span>'+(s.action_running?'<span class="status-dot on"></span>Running':'Idle')+'</span></div>';
+  // Only update mode text, NOT the checkbox (user controls it)
+  $('modeLabel').textContent=s.demo_mode?'Phone Control':'Touch/IMU Auto';
+}
+
+pollTimer=setInterval(pollStatus,1000);
+pollStatus();
+</script>
+</body></html>)raw";
 class CatTailAndNeckBoard : public WifiBoard {
 private:
     i2c_master_bus_handle_t codec_i2c_bus_;
@@ -75,6 +326,14 @@ private:
     ActionExecutor neck_exec_{GROUP_NECK, "neck"};
     ActionExecutor tail_exec_{GROUP_TAIL, "tail"};
     ActionExecutor head_exec_{GROUP_HEAD, "head"};
+
+
+    // ===== Demo system: WiFi AP + web control =====
+    bool demo_mode_ = false;
+    httpd_handle_t web_server_ = nullptr;
+    int last_touch_code_ = 0;
+    int last_touch_mv_ = 0;
+    static constexpr int kDemoCount = 5;
 
     // ===== Touch button + MPU-6050 gyro =====
     TaskHandle_t touch_task_ = nullptr;
@@ -182,6 +441,39 @@ private:
     //   SW0+SW3    = 摸头+右爪 → 愤怒 (angry)
     //   SW1+SW2    = 摸背+左爪 → 厌恶 (disgust)
     //   SW1+SW3    = 摸背+右爪 → 中性 (neutral)
+
+    // ===== Demo entries: 5 custom actions paired with cat audio =====
+    struct DemoEntry {
+        const char* name;
+        const ServoAction* action;
+        const std::string_view* sound;
+    };
+    static constexpr ServoAction kDemoAct_orig = {"demo_orig", 9000, kDemoOrigSeries, 1, GROUP_ALL};
+    static constexpr ServoAction kDemoAct_a3   = {"demo_a3",   9001, kDemoA3Series,   1, GROUP_ALL};
+    static constexpr ServoAction kDemoAct_a6   = {"demo_a6",   9002, kDemoA6Series,   1, GROUP_ALL};
+    static constexpr ServoAction kDemoAct_a7   = {"demo_a7",   9003, kDemoA7Series,   1, GROUP_ALL};
+    static constexpr ServoAction kDemoAct_a9   = {"demo_a9",   9004, kDemoA9Series,   1, GROUP_ALL};
+    static constexpr DemoEntry kDemoEntries[kDemoCount] = {
+        {"orig", &kDemoAct_orig, &Lang::Sounds::OGG_DEMO_ORIG},
+        {"A3",   &kDemoAct_a3,   &Lang::Sounds::OGG_DEMO_A3},
+        {"A6",   &kDemoAct_a6,   &Lang::Sounds::OGG_DEMO_A6},
+        {"A7",   &kDemoAct_a7,   &Lang::Sounds::OGG_DEMO_A7},
+        {"A9",   &kDemoAct_a9,   &Lang::Sounds::OGG_DEMO_A9},
+    };
+
+    void RunDemo(int idx) {
+        if (idx < 0 || idx >= kDemoCount) return;
+        neck_exec_.Stop(); tail_exec_.Stop(); head_exec_.Stop();
+        vTaskDelay(pdMS_TO_TICKS(100));
+        neck_exec_.ClearPending(); tail_exec_.ClearPending(); head_exec_.ClearPending();
+        auto& entry = kDemoEntries[idx];
+        neck_exec_.Run(entry.action->name, 100, 1, false, 1.0f);
+        tail_exec_.Run(entry.action->name, 100, 1, false, 1.0f);
+        head_exec_.Run(entry.action->name, 100, 1, false, 1.0f);
+        Application::GetInstance().PlaySound(*entry.sound);
+        ESP_LOGI(TAG, "Demo: %s started", entry.name);
+    }
+
     void OnTouch(int code) {
         if (code <= 0) return;
 
@@ -219,7 +511,6 @@ private:
             {Lang::Sounds::OGG_CAT_A23,  0.55f, 7410},   // mid, ~7.4s
             {Lang::Sounds::OGG_CAT_A1,   0.65f, 6460},   // mid-strong, ~6.5s
             {Lang::Sounds::OGG_CAT_B13,  0.80f, 5630},   // strong, ~5.6s
-            {Lang::Sounds::OGG_CAT_A15,  0.95f, 6760},   // most intense, ~6.8s
         };
         constexpr int kAudioPoolN = sizeof(kAudioPool) / sizeof(kAudioPool[0]);
 
@@ -252,7 +543,7 @@ private:
             // Gentle bias: mostly slow (150-180ms), rarely normal (100ms)
             return (r < 5) ? 150 : (r < 8 ? 180 : (r == 8 ? 120 : 0));  // 0=100ms
         };
-        // 3 dispatch modes (randomized):
+        // Unused variables removed for clean compile
         //   0-6: ALL only (5-servo synchronized)
         //   7-8: per-group combo
         //   9:   ALL + per-group back-to-back
@@ -297,6 +588,11 @@ private:
             }
         };
 
+
+        // Update web status with touch code
+        last_touch_code_ = code;
+        // In demo mode, skip touch-triggered actions
+        if (demo_mode_) return;
         switch (code) {
             case 0x01: { // 摸头 → 快乐  amp 1.4~1.8
                 float intensity, duration_ms; auto& snd = pickAudio(&intensity, &duration_ms);
@@ -487,7 +783,7 @@ private:
                         ESP_LOGI(TAG, "🌀 Motion: %s | Orient: %s", mpu6050_motion_name(motion),
                                  mpu6050_orient_name(mpu6050_get_orientation()));
                         // Motion → action (when enabled), randomized for variety + sound
-                        if (gyro_actions_enabled_) {
+                        if (gyro_actions_enabled_ && !demo_mode_) {
                             auto pick = [](const char* const* list, int n) -> const char* {
                                 return list[rand() % n];
                             };
@@ -499,7 +795,6 @@ private:
                                 {Lang::Sounds::OGG_CAT_A23,  0.55f, 7410},
                                 {Lang::Sounds::OGG_CAT_A1,   0.65f, 6460},
                                 {Lang::Sounds::OGG_CAT_B13,  0.80f, 5630},
-                                {Lang::Sounds::OGG_CAT_A15,  0.95f, 6760},
                             };
                             constexpr int kImuAudioN = sizeof(kImuAudio)/sizeof(kImuAudio[0]);
                             auto imuPickAudio = [&](float* int_out, float* dur_out) -> const std::string_view& {
@@ -1073,7 +1368,7 @@ private:
                                 if ((rand() % 100) < 30) {
                                     static const std::string_view kEmoteSounds[] = {
                                         Lang::Sounds::OGG_CAT_A1, Lang::Sounds::OGG_CAT_A6,
-                                        Lang::Sounds::OGG_CAT_A15, Lang::Sounds::OGG_CAT_A23,
+                                        Lang::Sounds::OGG_CAT_A1, Lang::Sounds::OGG_CAT_A23,
                                         Lang::Sounds::OGG_CAT_B3, Lang::Sounds::OGG_CAT_B13,
                                     };
                                     Application::GetInstance().PlaySound(kEmoteSounds[rand() % 6]);
@@ -1101,6 +1396,166 @@ private:
     }
 
 public:
+public:
+
+
+
+
+    // ===== WiFi AP + Web Server (runs alongside framework STA) =====
+    void InitAP() {
+        // Create AP netif (esp_netif already initialized by framework)
+        esp_netif_create_default_wifi_ap();
+        // Try to set APSTA mode without disrupting existing WiFi
+        esp_err_t ret = esp_wifi_set_mode(WIFI_MODE_APSTA);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "APSTA mode failed (%s) — AP may not be available", esp_err_to_name(ret));
+            return;
+        }
+        wifi_config_t wcfg = {};
+        strcpy((char*)wcfg.ap.ssid, "CatDemo");
+        wcfg.ap.ssid_len = strlen("CatDemo");
+        strcpy((char*)wcfg.ap.password, "12345678");
+        wcfg.ap.authmode = WIFI_AUTH_WPA_WPA2_PSK;
+        wcfg.ap.max_connection = 4;
+        ret = esp_wifi_set_config(WIFI_IF_AP, &wcfg);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "AP config failed: %s", esp_err_to_name(ret));
+            return;
+        }
+        ESP_LOGI(TAG, "WiFi AP ready: CatDemo / 12345678 → http://192.168.4.1");
+    }
+
+    static esp_err_t HandleRoot(httpd_req_t* req) {
+        httpd_resp_set_type(req, "text/html; charset=utf-8");
+        httpd_resp_send(req, kDemoHtml, strlen(kDemoHtml));
+        return ESP_OK;
+    }
+
+    static esp_err_t HandleStatus(httpd_req_t* req) {
+        auto* board = static_cast<CatTailAndNeckBoard*>(req->user_ctx);
+        // Do an immediate battery read if not yet initialized
+        if (board->battery_vbat_filtered_mv_ == 0 && board->adc_handle_) {
+            int raw = 0;
+            if (xSemaphoreTake(board->adc_mutex_, pdMS_TO_TICKS(100)) == pdTRUE) {
+                adc_oneshot_read(board->adc_handle_, BATTERY_ADC_CHANNEL, &raw);
+                xSemaphoreGive(board->adc_mutex_);
+            }
+            int mv = raw * 3300 / 4096;
+            if (board->adc_cali_handle_) {
+                int cali_mv = 0;
+                if (adc_cali_raw_to_voltage(board->adc_cali_handle_, raw, &cali_mv) == ESP_OK)
+                    mv = cali_mv;
+            }
+            int vbat_mv = (int)(mv * BATTERY_DIVIDER_RATIO);
+            board->battery_vbat_filtered_mv_ = vbat_mv;
+            board->battery_level_ = std::clamp((vbat_mv - BATTERY_EMPTY_VOLTAGE_MV) * 100 / (BATTERY_FULL_VOLTAGE_MV - BATTERY_EMPTY_VOLTAGE_MV), 0, 100);
+        }
+        char buf[512];
+        int level = board->battery_level_;
+        int vbat = board->battery_vbat_filtered_mv_;
+        bool running = board->neck_exec_.IsBusy() || board->tail_exec_.IsBusy() || board->head_exec_.IsBusy();
+        const char* orient = "N/A";
+        if (board->mpu_ok_) orient = mpu6050_orient_name(mpu6050_get_orientation());
+        snprintf(buf, sizeof(buf),
+            "{\"bat_pct\":%d,\"bat_mv\":%d,\"touch_code\":%d,\"touch_mv\":%d,\"gyro_ok\":\"%s\",\"orient\":\"%s\",\"action_running\":%s,\"demo_mode\":%s}",
+            level, vbat, board->last_touch_code_, board->last_touch_mv_,
+            board->mpu_ok_ ? "OK" : "NONE", orient,
+            running ? "true" : "false",
+            board->demo_mode_ ? "true" : "false");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, buf);
+        return ESP_OK;
+    }
+
+    static esp_err_t HandleDemo(httpd_req_t* req) {
+        auto* board = static_cast<CatTailAndNeckBoard*>(req->user_ctx);
+        char buf[64] = {};
+        httpd_req_recv(req, buf, sizeof(buf)-1);
+        int id = -1;
+        const char* p = strstr(buf, "\"id\":");
+        if (p) id = atoi(p + 5);
+        if (id >= 0 && id < 5) {
+            board->RunDemo(id);
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
+        } else {
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_sendstr(req, "{\"status\":\"error\",\"msg\":\"invalid id\"}");
+        }
+        return ESP_OK;
+    }
+
+    static esp_err_t HandleServo(httpd_req_t* req) {
+        auto* board = static_cast<CatTailAndNeckBoard*>(req->user_ctx);
+        char buf[128] = {};
+        httpd_req_recv(req, buf, sizeof(buf)-1);
+        int angles[5] = {90,90,90,90,90};
+        const char* p = strstr(buf, "\"angles\":");
+        if (p) {
+            p += 9;
+            for (int i = 0; i < 5; i++) {
+                while (*p == ' ' || *p == '[' || *p == ',') p++;
+                angles[i] = atoi(p);
+                if (angles[i] < 0) angles[i] = 0;
+                if (angles[i] > 180) angles[i] = 180;
+                while (*p && *p != ',' && *p != ']') p++;
+            }
+            for (int i = 0; i < 5; i++) SetServoAngle(i, angles[i]);
+        }
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
+        return ESP_OK;
+    }
+
+    static esp_err_t HandleStop(httpd_req_t* req) {
+        auto* board = static_cast<CatTailAndNeckBoard*>(req->user_ctx);
+        board->neck_exec_.Stop(); board->tail_exec_.Stop(); board->head_exec_.Stop();
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
+        return ESP_OK;
+    }
+
+    static esp_err_t HandleMode(httpd_req_t* req) {
+        auto* board = static_cast<CatTailAndNeckBoard*>(req->user_ctx);
+        char buf[64] = {};
+        httpd_req_recv(req, buf, sizeof(buf)-1);
+        const char* p = strstr(buf, "\"demo_mode\":");
+        if (p) {
+            p += 13;
+            board->demo_mode_ = (strncmp(p, "true", 4) == 0);
+            if (board->demo_mode_) {
+                board->neck_exec_.Stop(); board->tail_exec_.Stop(); board->head_exec_.Stop();
+            }
+            ESP_LOGI(TAG, "Demo mode: %s", board->demo_mode_ ? "ON (phone)" : "OFF (touch/IMU)");
+        }
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
+        return ESP_OK;
+    }
+
+    void StartWebServer() {
+        httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+        cfg.max_uri_handlers = 10;
+        httpd_start(&web_server_, &cfg);
+
+        auto reg = [this](const char* uri, esp_err_t (*handler)(httpd_req_t*), httpd_method_t method = HTTP_GET) {
+            httpd_uri_t u = {.uri = uri, .method = method, .handler = handler, .user_ctx = this};
+            httpd_register_uri_handler(web_server_, &u);
+        };
+        reg("/", HandleRoot);
+        reg("/api/status", HandleStatus);
+        reg("/api/demo", HandleDemo, HTTP_POST);
+        reg("/api/servo", HandleServo, HTTP_POST);
+        reg("/api/stop", HandleStop, HTTP_POST);
+        reg("/api/mode", HandleMode, HTTP_POST);
+        ESP_LOGI(TAG, "Web server started on http://192.168.4.1");
+    }
+
+    void UpdateTouchStatus(int code, int mv) {
+        last_touch_code_ = code;
+        last_touch_mv_ = mv;
+    }
+
     CatTailAndNeckBoard() : WifiBoard(), boot_button_(BOOT_BUTTON_GPIO) {
         esp_log_level_set("Display", ESP_LOG_NONE);
         InitializePowerManagement();  // Must be first: latch power, ADC init
@@ -1188,7 +1643,17 @@ public:
 
     // ===== Virtual overrides =====
 
-    virtual void StartNetwork() override { WifiBoard::StartNetwork(); }
+    virtual void StartNetwork() override {
+        WifiBoard::StartNetwork();
+        // Start AP + web server after WiFi stack is fully initialized
+        xTaskCreate([](void* arg) {
+            vTaskDelay(pdMS_TO_TICKS(3000));
+            auto* b = static_cast<CatTailAndNeckBoard*>(arg);
+            b->InitAP();
+            b->StartWebServer();
+            vTaskDelete(nullptr);
+        }, "web_init", 3584, this, 1, nullptr);
+    }
 
     virtual AudioCodec* GetAudioCodec() override {
         static Es8311AudioCodec audio_codec(
@@ -1212,5 +1677,9 @@ public:
         WifiBoard::SetPowerSaveLevel(level);
     }
 };
+
+
+// ===== Web control page =====
+
 
 DECLARE_BOARD(CatTailAndNeckBoard);
